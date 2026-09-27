@@ -1,5 +1,6 @@
 package school.greenwood.community
 
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -8,14 +9,23 @@ import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.origin
+import io.ktor.server.plugins.ratelimit.RateLimit
+import io.ktor.server.plugins.ratelimit.RateLimitName
+import io.ktor.server.plugins.ratelimit.rateLimit
 import io.ktor.server.request.receive
+import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.readRemaining
+import kotlinx.io.readByteArray
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
@@ -24,6 +34,8 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.minutes
 
 // — Comptes à jetons de mots (« eagle-smell-bootlace-… ») --------------------
 
@@ -413,181 +425,246 @@ class Stockage(private val fichier: File) {
 
 private val now: Long get() = System.currentTimeMillis()
 
-fun Application.module(stockage: Stockage, jetonAdmin: String? = System.getenv("GWS_ADMIN_TOKEN")) {
+// — Limitation de débit ------------------------------------------------------
+
+/** Taille maximale d'un corps de requête : au-delà, réponse 413. Chaque
+ *  écriture réécrit le fichier JSON en entier, on ne lit donc jamais un corps
+ *  plus gros que nécessaire. */
+const val TAILLE_CORPS_MAXIMALE = 10 * 1024
+
+/** Seuils de limitation de débit, surchargeables dans les tests. */
+data class Limites(
+    val écritureParJeton: Int = 30,      // écritures / minute / jeton
+    val écritureParIP: Int = 60,         // écritures / minute / IP
+    val inscriptionParMinute: Int = 10,  // comptes / minute / IP
+    val inscriptionParJour: Int = 100,   // comptes / 24 h / IP
+)
+
+fun Application.module(
+    stockage: Stockage,
+    jetonAdmin: String? = System.getenv("GWS_ADMIN_TOKEN"),
+    limites: Limites = Limites(),
+) {
     install(ContentNegotiation) { json() }
+
+    install(RateLimit) {
+        // Écritures : un budget par jeton (ou par IP, faute de jeton), puis un
+        // plafond global par IP qui les englobe tous — derrière un NAT, toute
+        // une école partage la même adresse mais peut aussi être visée d'un
+        // seul trait.
+        register(RateLimitName("ecriture")) {
+            rateLimiter(limit = limites.écritureParJeton, refillPeriod = 1.minutes)
+            requestKey { call ->
+                jetonDans(call.request.headers["Authorization"]) ?: call.request.origin.remoteHost
+            }
+        }
+        register(RateLimitName("ecriture-ip")) {
+            rateLimiter(limit = limites.écritureParIP, refillPeriod = 1.minutes)
+            requestKey { call -> call.request.origin.remoteHost }
+        }
+        // Inscription : POST /compte est la route la plus abusable — un script
+        // y crée gratuitement des jetons. Rafale bornée à la minute, puis
+        // budget quotidien, tous deux par IP.
+        register(RateLimitName("inscription-rafale")) {
+            rateLimiter(limit = limites.inscriptionParMinute, refillPeriod = 1.minutes)
+            requestKey { call -> call.request.origin.remoteHost }
+        }
+        register(RateLimitName("inscription-jour")) {
+            rateLimiter(limit = limites.inscriptionParJour, refillPeriod = 24.hours)
+            requestKey { call -> call.request.origin.remoteHost }
+        }
+    }
 
     routing {
         get("/health") { call.respondText("OK") }
 
-        // Inscription : le serveur attribue un jeton de mots — aucun nom,
-        // aucune donnée personnelle ne transite jamais.
-        post("/compte") {
-            val jeton = générerJeton()
-            stockage.comptes.add(jeton)
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.Created, Compte(jeton))
-        }
-
-        // Révocation : le jeton cesse d'exister et ne peut plus rien écrire.
-        // Le contenu qu'il a publié reste en place, supprimable ensuite par la
-        // modération — un jeton révoqué ne peut plus agir, ni même se
-        // supprimer lui-même.
-        delete("/compte") {
-            val jeton = call.jeton() ?: return@delete call.respond(HttpStatusCode.Unauthorized, "Jeton requis")
-            if (!stockage.révoquerJeton(jeton)) {
-                return@delete call.respond(HttpStatusCode.Unauthorized, "Jeton inconnu ou révoqué")
-            }
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.NoContent)
-        }
-
+        // Les lectures ne réécrivent rien : aucune limitation de débit.
         // Suggestions de devoirs — les réponses publiques ne portent jamais
         // le jeton de l'auteur, qui permettrait d'identifier un compte.
         get("/devoirs") { call.respond(stockage.devoirs.map { it.public() }) }
-        post("/devoirs") {
-            val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
-            val entrée = call.receive<DevoirEntrée>()
-            if (entrée.matière.isBlank() || entrée.contenu.isBlank()) {
-                return@post call.respond(HttpStatusCode.BadRequest, "matière et contenu sont obligatoires")
-            }
-            val devoir = Devoir(
-                id = stockage.id(), auteur = jeton, matière = entrée.matière,
-                contenu = entrée.contenu, dateRemise = entrée.dateRemise, crééÀ = now,
-            )
-            stockage.devoirs.add(devoir)
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.Created, devoir.public())
-        }
-        // Suppression : réservée à l'auteur du jeton ou à la modération.
-        delete("/devoirs/{id}") {
-            val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
-            val id = call.parameters["id"]?.toLongOrNull()
-                ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
-            val devoir = stockage.devoirs.find { it.id == id }
-                ?: return@delete call.respond(HttpStatusCode.NotFound, "devoir introuvable")
-            if (!peutSupprimer(devoir.auteur, jeton, jetonAdmin)) {
-                return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer ce devoir")
-            }
-            stockage.supprimerDevoir(id)
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.NoContent)
-        }
-        // Un vote par jeton et par devoir : un second vote remplace le premier.
-        post("/devoirs/{id}/vote") {
-            val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
-            val id = call.parameters["id"]?.toLongOrNull()
-                ?: return@post call.respond(HttpStatusCode.BadRequest, "id invalide")
-            val vote = call.receive<Vote>().vote
-            if (vote != 1 && vote != -1) {
-                return@post call.respond(HttpStatusCode.BadRequest, "vote doit valoir +1 ou -1")
-            }
-            val devoir = stockage.devoirs.find { it.id == id }
-                ?: return@post call.respond(HttpStatusCode.NotFound, "devoir introuvable")
-            if (devoir.auteur == jeton) {
-                return@post call.respond(HttpStatusCode.Forbidden, "on ne vote pas pour sa propre suggestion")
-            }
-            val modifié = stockage.voter(id, jeton, vote)
-            stockage.sauvegarder()
-            call.respond(modifié.public())
-        }
 
         // Signalements d'emploi du temps
         get("/edt/problemes") { call.respond(stockage.problèmes) }
-        post("/edt/problemes") {
-            val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
-            val entrée = call.receive<ProblèmeEntrée>()
-            if (entrée.description.isBlank() || entrée.date.isBlank()) {
-                return@post call.respond(HttpStatusCode.BadRequest, "description et date sont obligatoires")
-            }
-            val problème = Problème(stockage.id(), jeton, entrée.description, entrée.date, now)
-            stockage.problèmes.add(problème)
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.Created, problème)
-        }
-        delete("/edt/problemes/{id}") {
-            val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
-            val id = call.parameters["id"]?.toLongOrNull()
-                ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
-            val problème = stockage.problèmes.find { it.id == id }
-                ?: return@delete call.respond(HttpStatusCode.NotFound, "problème introuvable")
-            if (!peutSupprimer(problème.auteur, jeton, jetonAdmin)) {
-                return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer ce signalement")
-            }
-            stockage.supprimerProblème(id)
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.NoContent)
-        }
 
         // Corrections proposées pour l'emploi du temps
         get("/edt/corrections") { call.respond(stockage.corrections) }
-        post("/edt/corrections") {
-            val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
-            val entrée = call.receive<CorrectionEntrée>()
-            if (entrée.description.isBlank() || entrée.date.isBlank()) {
-                return@post call.respond(HttpStatusCode.BadRequest, "description et date sont obligatoires")
-            }
-            entrée.problèmeId?.let { id ->
-                if (stockage.problèmes.none { it.id == id }) {
-                    return@post call.respond(HttpStatusCode.BadRequest, "problèmeId $id inconnu")
-                }
-            }
-            val correction = Correction(
-                stockage.id(), jeton, entrée.problèmeId, entrée.description, entrée.date, now,
-            )
-            stockage.corrections.add(correction)
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.Created, correction)
-        }
-        delete("/edt/corrections/{id}") {
-            val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
-            val id = call.parameters["id"]?.toLongOrNull()
-                ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
-            val correction = stockage.corrections.find { it.id == id }
-                ?: return@delete call.respond(HttpStatusCode.NotFound, "correction introuvable")
-            if (!peutSupprimer(correction.auteur, jeton, jetonAdmin)) {
-                return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer cette correction")
-            }
-            stockage.supprimerCorrection(id)
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.NoContent)
-        }
 
         // Signalements d'abus : un contenu est signalé à la modération, qui
         // peut ensuite le supprimer. Le jeton du signalant reste secret.
         get("/signalements") { call.respond(stockage.signalements.map { it.public() }) }
-        post("/signalements") {
-            val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
-            val entrée = call.receive<SignalementEntrée>()
-            if (entrée.raison.isBlank()) {
-                return@post call.respond(HttpStatusCode.BadRequest, "raison obligatoire")
+
+        // Inscription : rafale à la minute puis budget quotidien, par IP.
+        rateLimit(RateLimitName("inscription-rafale")) {
+            rateLimit(RateLimitName("inscription-jour")) {
+                // Inscription : le serveur attribue un jeton de mots — aucun nom,
+                // aucune donnée personnelle ne transite jamais.
+                post("/compte") {
+                    val jeton = générerJeton()
+                    stockage.comptes.add(jeton)
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.Created, Compte(jeton))
+                }
             }
-            if (entrée.cible !in CIBLES) {
-                return@post call.respond(
-                    HttpStatusCode.BadRequest, "cible doit valoir devoir, probleme ou correction")
+        }
+
+        // Écritures : budget par jeton, puis plafond par IP qui les englobe.
+        rateLimit(RateLimitName("ecriture")) {
+            rateLimit(RateLimitName("ecriture-ip")) {
+                // Révocation : le jeton cesse d'exister et ne peut plus rien écrire.
+                // Le contenu qu'il a publié reste en place, supprimable ensuite par la
+                // modération — un jeton révoqué ne peut plus agir, ni même se
+                // supprimer lui-même.
+                delete("/compte") {
+                    val jeton = call.jeton() ?: return@delete call.respond(HttpStatusCode.Unauthorized, "Jeton requis")
+                    if (!stockage.révoquerJeton(jeton)) {
+                        return@delete call.respond(HttpStatusCode.Unauthorized, "Jeton inconnu ou révoqué")
+                    }
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.NoContent)
+                }
+
+                post("/devoirs") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
+                    val entrée = call.recevoirÉcriture<DevoirEntrée>() ?: return@post
+                    if (entrée.matière.isBlank() || entrée.contenu.isBlank()) {
+                        return@post call.respond(HttpStatusCode.BadRequest, "matière et contenu sont obligatoires")
+                    }
+                    val devoir = Devoir(
+                        id = stockage.id(), auteur = jeton, matière = entrée.matière,
+                        contenu = entrée.contenu, dateRemise = entrée.dateRemise, crééÀ = now,
+                    )
+                    stockage.devoirs.add(devoir)
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.Created, devoir.public())
+                }
+                // Suppression : réservée à l'auteur du jeton ou à la modération.
+                delete("/devoirs/{id}") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
+                    val id = call.parameters["id"]?.toLongOrNull()
+                        ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
+                    val devoir = stockage.devoirs.find { it.id == id }
+                        ?: return@delete call.respond(HttpStatusCode.NotFound, "devoir introuvable")
+                    if (!peutSupprimer(devoir.auteur, jeton, jetonAdmin)) {
+                        return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer ce devoir")
+                    }
+                    stockage.supprimerDevoir(id)
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.NoContent)
+                }
+                // Un vote par jeton et par devoir : un second vote remplace le premier.
+                post("/devoirs/{id}/vote") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
+                    val id = call.parameters["id"]?.toLongOrNull()
+                        ?: return@post call.respond(HttpStatusCode.BadRequest, "id invalide")
+                    val vote = (call.recevoirÉcriture<Vote>() ?: return@post).vote
+                    if (vote != 1 && vote != -1) {
+                        return@post call.respond(HttpStatusCode.BadRequest, "vote doit valoir +1 ou -1")
+                    }
+                    val devoir = stockage.devoirs.find { it.id == id }
+                        ?: return@post call.respond(HttpStatusCode.NotFound, "devoir introuvable")
+                    if (devoir.auteur == jeton) {
+                        return@post call.respond(HttpStatusCode.Forbidden, "on ne vote pas pour sa propre suggestion")
+                    }
+                    val modifié = stockage.voter(id, jeton, vote)
+                    stockage.sauvegarder()
+                    call.respond(modifié.public())
+                }
+
+                post("/edt/problemes") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
+                    val entrée = call.recevoirÉcriture<ProblèmeEntrée>() ?: return@post
+                    if (entrée.description.isBlank() || entrée.date.isBlank()) {
+                        return@post call.respond(HttpStatusCode.BadRequest, "description et date sont obligatoires")
+                    }
+                    val problème = Problème(stockage.id(), jeton, entrée.description, entrée.date, now)
+                    stockage.problèmes.add(problème)
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.Created, problème)
+                }
+                delete("/edt/problemes/{id}") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
+                    val id = call.parameters["id"]?.toLongOrNull()
+                        ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
+                    val problème = stockage.problèmes.find { it.id == id }
+                        ?: return@delete call.respond(HttpStatusCode.NotFound, "problème introuvable")
+                    if (!peutSupprimer(problème.auteur, jeton, jetonAdmin)) {
+                        return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer ce signalement")
+                    }
+                    stockage.supprimerProblème(id)
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.NoContent)
+                }
+
+                post("/edt/corrections") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
+                    val entrée = call.recevoirÉcriture<CorrectionEntrée>() ?: return@post
+                    if (entrée.description.isBlank() || entrée.date.isBlank()) {
+                        return@post call.respond(HttpStatusCode.BadRequest, "description et date sont obligatoires")
+                    }
+                    entrée.problèmeId?.let { id ->
+                        if (stockage.problèmes.none { it.id == id }) {
+                            return@post call.respond(HttpStatusCode.BadRequest, "problèmeId $id inconnu")
+                        }
+                    }
+                    val correction = Correction(
+                        stockage.id(), jeton, entrée.problèmeId, entrée.description, entrée.date, now,
+                    )
+                    stockage.corrections.add(correction)
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.Created, correction)
+                }
+                delete("/edt/corrections/{id}") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
+                    val id = call.parameters["id"]?.toLongOrNull()
+                        ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
+                    val correction = stockage.corrections.find { it.id == id }
+                        ?: return@delete call.respond(HttpStatusCode.NotFound, "correction introuvable")
+                    if (!peutSupprimer(correction.auteur, jeton, jetonAdmin)) {
+                        return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer cette correction")
+                    }
+                    stockage.supprimerCorrection(id)
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.NoContent)
+                }
+
+                post("/signalements") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
+                    val entrée = call.recevoirÉcriture<SignalementEntrée>() ?: return@post
+                    if (entrée.raison.isBlank()) {
+                        return@post call.respond(HttpStatusCode.BadRequest, "raison obligatoire")
+                    }
+                    if (entrée.cible !in CIBLES) {
+                        return@post call.respond(
+                            HttpStatusCode.BadRequest, "cible doit valoir devoir, probleme ou correction")
+                    }
+                    val cibleExiste = when (entrée.cible) {
+                        "devoir" -> stockage.devoirs.any { it.id == entrée.cibleId }
+                        "probleme" -> stockage.problèmes.any { it.id == entrée.cibleId }
+                        else -> stockage.corrections.any { it.id == entrée.cibleId }
+                    }
+                    if (!cibleExiste) {
+                        return@post call.respond(
+                            HttpStatusCode.NotFound, "${entrée.cible} ${entrée.cibleId} introuvable")
+                    }
+                    val signalement = stockage.signaler(jeton, entrée.cible, entrée.cibleId, entrée.raison)
+                        ?: return@post call.respond(HttpStatusCode.Conflict, "contenu déjà signalé")
+                    stockage.sauvegarder()
+                    call.respond(HttpStatusCode.Created, signalement.public())
+                }
             }
-            val cibleExiste = when (entrée.cible) {
-                "devoir" -> stockage.devoirs.any { it.id == entrée.cibleId }
-                "probleme" -> stockage.problèmes.any { it.id == entrée.cibleId }
-                else -> stockage.corrections.any { it.id == entrée.cibleId }
-            }
-            if (!cibleExiste) {
-                return@post call.respond(
-                    HttpStatusCode.NotFound, "${entrée.cible} ${entrée.cibleId} introuvable")
-            }
-            val signalement = stockage.signaler(jeton, entrée.cible, entrée.cibleId, entrée.raison)
-                ?: return@post call.respond(HttpStatusCode.Conflict, "contenu déjà signalé")
-            stockage.sauvegarder()
-            call.respond(HttpStatusCode.Created, signalement.public())
         }
     }
 }
 
-/** Extrait le jeton « Bearer … » de l'en-tête Authorization. */
-private fun io.ktor.server.routing.RoutingCall.jeton(): String? {
-    val entête = request.headers["Authorization"] ?: return null
-    val parties = entête.split(' ', limit = 2)
+/** Extrait le jeton « Bearer … » d'un en-tête Authorization. */
+private fun jetonDans(entête: String?): String? {
+    val parties = entête?.split(' ', limit = 2) ?: return null
     return if (parties.size == 2 && parties[0] == "Bearer" && parties[1].isNotBlank()) parties[1].trim() else null
 }
+
+/** Extrait le jeton « Bearer … » de l'en-tête Authorization. */
+private fun io.ktor.server.routing.RoutingCall.jeton(): String? =
+    jetonDans(request.headers["Authorization"])
 
 /** Jeton exigé pour toute écriture : un compte connu du serveur (donc non
  *  révoqué) ou le jeton de modération. Répond 401 et renvoie null sinon. */
@@ -604,6 +681,32 @@ private suspend fun io.ktor.server.routing.RoutingCall.jetonÉcriture(
         return null
     }
     return jeton
+}
+
+/** Reçoit le corps JSON d'une écriture. Au-delà de [TAILLE_CORPS_MAXIMALE]
+ *  octets, répond 413 et renvoie null : l'appelant abandonne alors la route.
+ *  Un corps déclaré (Content-Length) est refusé avant lecture ; un corps sans
+ *  longueur déclarée (« chunked ») est lu à la laisse, jamais plus. */
+private suspend inline fun <reified T : Any> io.ktor.server.routing.RoutingCall.recevoirÉcriture(): T? {
+    val déclarée = request.headers[HttpHeaders.ContentLength]?.toLongOrNull()
+    if (déclarée != null) {
+        if (déclarée > TAILLE_CORPS_MAXIMALE) {
+            respond(HttpStatusCode.PayloadTooLarge, "corps limité à 10 Ko")
+            return null
+        }
+        return receive<T>()
+    }
+    val lu = receiveChannel().readRemaining(TAILLE_CORPS_MAXIMALE + 1L).readByteArray()
+    if (lu.size > TAILLE_CORPS_MAXIMALE) {
+        respond(HttpStatusCode.PayloadTooLarge, "corps limité à 10 Ko")
+        return null
+    }
+    return try {
+        Json.decodeFromString<T>(lu.decodeToString())
+    } catch (e: SerializationException) {
+        respond(HttpStatusCode.BadRequest, "corps JSON invalide")
+        null
+    }
 }
 
 /** True si le jeton est celui de la modération (« GWS_ADMIN_TOKEN »). */
