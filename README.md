@@ -29,15 +29,29 @@ Authorization: Bearer eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse
 
 Le serveur ne reçoit jamais de nom ; les lectures sont publiques.
 
+Les jetons d'auteur ne figurent jamais dans une réponse : `GET /devoirs`,
+`POST /devoirs` et `POST /devoirs/{id}/vote` renvoient un devoir sans champ
+`auteur`, ce qui empêche d'identifier (ou de deviner) un compte à partir des
+listes publiques.
+
+## Votes
+
+- Un vote est enregistré par couple `(devoirId, jeton)` : **un jeton ne
+  compte qu'une fois par devoir**.
+- Un second vote du même jeton **remplace** le précédent (+1 → −1 → +1),
+  il ne se cumule jamais.
+- On ne vote pas pour sa propre suggestion : `403 Forbidden`.
+- `vote` n'accepte que `+1` ou `−1`, sinon `400 Bad Request`.
+
 ## API
 
 | Méthode | Chemin | Auth | Corps |
 |---|---|---|---|
 | POST | `/compte` | — | — |
 | GET | `/health` | — | — |
-| GET | `/devoirs` | — | — |
+| GET | `/devoirs` | — | — (sans `auteur`) |
 | POST | `/devoirs` | jeton | `{"matière","contenu","dateRemise"?}` |
-| POST | `/devoirs/{id}/vote` | jeton | `{"vote":1 ou -1}` (pas pour soi-même) |
+| POST | `/devoirs/{id}/vote` | jeton | `{"vote":1 ou -1}` (un vote par jeton, remplace le précédent, pas pour soi-même) |
 | GET | `/edt/problemes` | — | — |
 | POST | `/edt/problemes` | jeton | `{"description","date"}` |
 | GET | `/edt/corrections` | — | — |

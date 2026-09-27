@@ -11,6 +11,29 @@ import kotlin.test.*
 private fun jetonDe(s: String): String =
     Regex(""""jeton":"([^"]+)"""").find(s)!!.groupValues[1]
 
+private fun idDe(s: String): Long =
+    Regex(""""id":(\d+)""").find(s)!!.groupValues[1].toLong()
+
+private suspend fun io.ktor.client.HttpClient.nouveauDevoir(jeton: String): Long {
+    val rep = post("/devoirs") {
+        header("Authorization", "Bearer $jeton")
+        contentType(ContentType.Application.Json)
+        setBody("""{"matière":"SVT","contenu":"Lire le chapitre 3"}""")
+    }
+    assertEquals(HttpStatusCode.Created, rep.status)
+    return idDe(rep.bodyAsText())
+}
+
+private suspend fun io.ktor.client.HttpClient.voter(id: Long, jeton: String, vote: Int) =
+    post("/devoirs/$id/vote") {
+        header("Authorization", "Bearer $jeton")
+        contentType(ContentType.Application.Json)
+        setBody("""{"vote":$vote}""")
+    }
+
+private fun votesDe(corps: String): Int =
+    Regex(""""votes":(-?\d+)""").find(corps)!!.groupValues[1].toInt()
+
 class ModuleTest {
     private fun Application.avecStockageTemporaire() =
         module(Stockage(File.createTempFile("test", ".json")))
@@ -58,7 +81,7 @@ class ModuleTest {
         assertEquals(HttpStatusCode.Created, rep.status)
         val corps = client.get("/devoirs").bodyAsText()
         assertTrue(corps.contains("Exercices 1 à 5"))
-        assertTrue(corps.contains(jeton), "l'auteur est le jeton")
+        assertFalse(corps.contains(jeton), "le jeton de l'auteur reste secret")
     }
 
     @Test
@@ -131,6 +154,71 @@ class ModuleTest {
             setBody("""{"vote":5}""")
         }
         assertEquals(HttpStatusCode.BadRequest, rep.status)
+    }
+
+    @Test
+    fun `un second vote du même jeton remplace le premier`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jetonA = jetonDe(client.post("/compte").bodyAsText())
+        val jetonB = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jetonA)
+
+        assertEquals(1, votesDe(client.voter(id, jetonB, 1).bodyAsText()))
+        assertEquals(1, votesDe(client.voter(id, jetonB, 1).bodyAsText()), "revoter ne cumule pas")
+        assertEquals(-1, votesDe(client.voter(id, jetonB, -1).bodyAsText()), "le vote remplace le précédent")
+        assertEquals(-1, votesDe(client.voter(id, jetonB, -1).bodyAsText()))
+        assertEquals(1, votesDe(client.voter(id, jetonB, 1).bodyAsText()))
+    }
+
+    @Test
+    fun `les votes de jetons différents se cumulent`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jetonA = jetonDe(client.post("/compte").bodyAsText())
+        val jetonB = jetonDe(client.post("/compte").bodyAsText())
+        val jetonC = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jetonA)
+
+        assertEquals(HttpStatusCode.OK, client.voter(id, jetonB, 1).status)
+        assertEquals(HttpStatusCode.OK, client.voter(id, jetonC, 1).status)
+        val troisième = client.voter(id, jetonC, -1)
+        assertEquals(""""votes":0""", Regex(""""votes":-?\d+""").find(troisième.bodyAsText())!!.value)
+        assertTrue(client.get("/devoirs").bodyAsText().contains(""""votes":0"""))
+    }
+
+    @Test
+    fun `le jeton de l'auteur ne figure dans aucune réponse publique`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jetonA = jetonDe(client.post("/compte").bodyAsText())
+        val jetonB = jetonDe(client.post("/compte").bodyAsText())
+
+        val création = client.post("/devoirs") {
+            header("Authorization", "Bearer $jetonA")
+            contentType(ContentType.Application.Json)
+            setBody("""{"matière":"SVT","contenu":"Chapitre 3"}""")
+        }
+        val id = idDe(création.bodyAsText())
+        assertFalse(création.bodyAsText().contains(jetonA), "POST /devoirs ne renvoie pas l'auteur")
+        assertFalse(client.get("/devoirs").bodyAsText().contains(jetonA), "GET /devoirs ne révèle pas l'auteur")
+        assertFalse(client.voter(id, jetonB, 1).bodyAsText().contains(jetonA), "le vote ne révèle pas l'auteur")
+    }
+
+    @Test
+    fun `les votes survivent à un rechargement`() {
+        val fichier = File.createTempFile("test", ".json")
+        fichier.delete()
+        val s1 = Stockage(fichier)
+        s1.devoirs.add(Devoir(1, "auteur-jeton", "Maths", "x", null, 0, 0))
+        s1.voter(1, "autre-jeton", 1)
+        s1.voter(1, "autre-jeton", -1)
+        s1.sauvegarder()
+
+        val s2 = Stockage(fichier)
+        s2.charger()
+        val votesRechargés: Map<String, Int> = s2.votes.getValue(1L)
+        assertEquals(mapOf("autre-jeton" to -1), votesRechargés)
+        assertEquals(-1, s2.devoirs.single().votes)
+        assertEquals(-1, s2.voter(1, "autre-jeton", -1).votes, "le vote remplace toujours le précédent")
+        fichier.delete()
     }
 
     @Test
