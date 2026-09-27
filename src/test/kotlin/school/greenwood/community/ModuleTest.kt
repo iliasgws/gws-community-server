@@ -31,12 +31,23 @@ private suspend fun io.ktor.client.HttpClient.voter(id: Long, jeton: String, vot
         setBody("""{"vote":$vote}""")
     }
 
+private suspend fun io.ktor.client.HttpClient.supprimer(chemin: String, jeton: String?) =
+    delete(chemin) { jeton?.let { header("Authorization", "Bearer $it") } }
+
+private suspend fun io.ktor.client.HttpClient.signaler(
+    cible: String, cibleId: Long, jeton: String?, raison: String = "contenu inapproprié",
+) = post("/signalements") {
+    jeton?.let { header("Authorization", "Bearer $it") }
+    contentType(ContentType.Application.Json)
+    setBody("""{"cible":"$cible","cibleId":$cibleId,"raison":"$raison"}""")
+}
+
 private fun votesDe(corps: String): Int =
     Regex(""""votes":(-?\d+)""").find(corps)!!.groupValues[1].toInt()
 
 class ModuleTest {
-    private fun Application.avecStockageTemporaire() =
-        module(Stockage(File.createTempFile("test", ".json")))
+    private fun Application.avecStockageTemporaire(jetonAdmin: String? = null) =
+        module(Stockage(File.createTempFile("test", ".json")), jetonAdmin)
 
     @Test
     fun `health répond OK`() = testApplication {
@@ -278,6 +289,229 @@ class ModuleTest {
         s2.charger()
         assertEquals(1, s2.devoirs.size)
         assertTrue(s2.comptes.contains("eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse"))
+        fichier.delete()
+    }
+
+    // — Suppression ---------------------------------------------------------
+
+    @Test
+    fun `l'auteur peut supprimer son devoir`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jeton)
+
+        val rep = client.supprimer("/devoirs/$id", jeton)
+        assertEquals(HttpStatusCode.NoContent, rep.status)
+        assertFalse(client.get("/devoirs").bodyAsText().contains("Lire le chapitre 3"))
+    }
+
+    @Test
+    fun `un autre jeton ne peut pas supprimer le devoir d'autrui`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jetonA = jetonDe(client.post("/compte").bodyAsText())
+        val jetonB = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jetonA)
+
+        assertEquals(HttpStatusCode.Forbidden, client.supprimer("/devoirs/$id", jetonB).status)
+        assertTrue(client.get("/devoirs").bodyAsText().contains("Lire le chapitre 3"))
+    }
+
+    @Test
+    fun `supprimer sans jeton est refusé`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jeton)
+
+        assertEquals(HttpStatusCode.Unauthorized, client.supprimer("/devoirs/$id", null).status)
+        assertEquals(HttpStatusCode.Unauthorized, client.supprimer("/devoirs/$id", "jeton-inexistant").status)
+        assertTrue(client.get("/devoirs").bodyAsText().contains("Lire le chapitre 3"))
+    }
+
+    @Test
+    fun `supprimer un devoir inconnu renvoie 404`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        assertEquals(HttpStatusCode.NotFound, client.supprimer("/devoirs/999", jeton).status)
+        assertEquals(HttpStatusCode.BadRequest, client.supprimer("/devoirs/abc", jeton).status)
+    }
+
+    @Test
+    fun `le jeton de modération supprime n'importe quel contenu`() = testApplication {
+        application { avecStockageTemporaire(jetonAdmin = "clé-de-modération") }
+        val jetonA = jetonDe(client.post("/compte").bodyAsText())
+        val jetonB = jetonDe(client.post("/compte").bodyAsText())
+        val admin = "clé-de-modération"
+
+        val idDevoir = client.nouveauDevoir(jetonA)
+        val problème = client.post("/edt/problemes") {
+            header("Authorization", "Bearer $jetonA")
+            contentType(ContentType.Application.Json)
+            setBody("""{"description":"Salle erronée","date":"2026-09-28"}""")
+        }.bodyAsText()
+        val idProblème = idDe(problème)
+        val correction = client.post("/edt/corrections") {
+            header("Authorization", "Bearer $jetonB")
+            contentType(ContentType.Application.Json)
+            setBody("""{"description":"Physique en salle 204","date":"2026-09-28"}""")
+        }.bodyAsText()
+        val idCorrection = idDe(correction)
+
+        assertEquals(HttpStatusCode.NoContent, client.supprimer("/devoirs/$idDevoir", admin).status)
+        assertEquals(HttpStatusCode.NoContent, client.supprimer("/edt/problemes/$idProblème", admin).status)
+        assertEquals(HttpStatusCode.NoContent, client.supprimer("/edt/corrections/$idCorrection", admin).status)
+
+        assertFalse(client.get("/devoirs").bodyAsText().contains("Lire le chapitre 3"))
+        assertFalse(client.get("/edt/problemes").bodyAsText().contains("Salle erronée"))
+        assertFalse(client.get("/edt/corrections").bodyAsText().contains("salle 204"))
+    }
+
+    @Test
+    fun `une clé de modération ne donne aucun droit si elle n'est pas configurée`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jetonA = jetonDe(client.post("/compte").bodyAsText())
+        val jetonB = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jetonA)
+
+        assertEquals(HttpStatusCode.Unauthorized, client.supprimer("/devoirs/$id", "clé-de-modération").status)
+        assertEquals(HttpStatusCode.Forbidden, client.supprimer("/devoirs/$id", jetonB).status)
+    }
+
+    @Test
+    fun `un auteur peut supprimer son signalement et sa correction d'emploi du temps`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        val problème = client.post("/edt/problemes") {
+            header("Authorization", "Bearer $jeton")
+            contentType(ContentType.Application.Json)
+            setBody("""{"description":"Cours absent","date":"2026-09-28"}""")
+        }.bodyAsText()
+        val idProblème = idDe(problème)
+        val correction = client.post("/edt/corrections") {
+            header("Authorization", "Bearer $jeton")
+            contentType(ContentType.Application.Json)
+            setBody("""{"description":"Cours en salle 12","date":"2026-09-28"}""")
+        }.bodyAsText()
+        val idCorrection = idDe(correction)
+
+        assertEquals(HttpStatusCode.Forbidden, client.supprimer("/edt/problemes/$idProblème",
+            jetonDe(client.post("/compte").bodyAsText())).status)
+        assertEquals(HttpStatusCode.NoContent, client.supprimer("/edt/problemes/$idProblème", jeton).status)
+        assertEquals(HttpStatusCode.NoContent, client.supprimer("/edt/corrections/$idCorrection", jeton).status)
+        assertFalse(client.get("/edt/problemes").bodyAsText().contains("Cours absent"))
+        assertFalse(client.get("/edt/corrections").bodyAsText().contains("salle 12"))
+    }
+
+    // — Révocation du compte ------------------------------------------------
+
+    @Test
+    fun `supprimer son compte révoque le jeton`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+
+        assertEquals(HttpStatusCode.NoContent, client.supprimer("/compte", jeton).status)
+
+        val écriture = client.post("/devoirs") {
+            header("Authorization", "Bearer $jeton")
+            contentType(ContentType.Application.Json)
+            setBody("""{"matière":"SVT","contenu":"Chapitre 3"}""")
+        }
+        assertEquals(HttpStatusCode.Unauthorized, écriture.status, "jeton révoqué, plus aucune écriture")
+        assertEquals(HttpStatusCode.Unauthorized, client.supprimer("/compte", jeton).status)
+        assertEquals(HttpStatusCode.Unauthorized, client.voter(1, jeton, 1).status)
+    }
+
+    @Test
+    fun `révoquer un jeton inconnu est refusé`() = testApplication {
+        application { avecStockageTemporaire() }
+        assertEquals(HttpStatusCode.Unauthorized, client.supprimer("/compte", null).status)
+        assertEquals(HttpStatusCode.Unauthorized, client.supprimer("/compte", "jamais-émis").status)
+    }
+
+    // — Signalements d'abus -------------------------------------------------
+
+    @Test
+    fun `on peut signaler un contenu sans révéler son identité`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jetonA = jetonDe(client.post("/compte").bodyAsText())
+        val jetonB = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jetonA)
+
+        val rep = client.signaler("devoir", id, jetonB, "harcèlement")
+        assertEquals(HttpStatusCode.Created, rep.status)
+        assertFalse(rep.bodyAsText().contains(jetonB), "le signalant reste secret")
+
+        val liste = client.get("/signalements").bodyAsText()
+        assertTrue(liste.contains("harcèlement"))
+        assertFalse(liste.contains(jetonB), "le signalant reste secret")
+        assertFalse(liste.contains(jetonA))
+    }
+
+    @Test
+    fun `signaler deux fois le même contenu est refusé`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jeton)
+
+        assertEquals(HttpStatusCode.Created, client.signaler("devoir", id, jeton).status)
+        assertEquals(HttpStatusCode.Conflict, client.signaler("devoir", id, jeton).status)
+        assertEquals(1, Regex(""""cible":"""").findAll(client.get("/signalements").bodyAsText()).count())
+    }
+
+    @Test
+    fun `signaler sans jeton valide est refusé`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jeton)
+
+        assertEquals(HttpStatusCode.Unauthorized, client.signaler("devoir", id, null).status)
+        assertEquals(HttpStatusCode.Unauthorized, client.signaler("devoir", id, "jeton-inexistant").status)
+        assertFalse(client.get("/signalements").bodyAsText().contains("cible"))
+    }
+
+    @Test
+    fun `signaler une cible inconnue ou invalide est refusé`() = testApplication {
+        application { avecStockageTemporaire() }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+
+        assertEquals(HttpStatusCode.NotFound, client.signaler("devoir", 999, jeton).status)
+        assertEquals(HttpStatusCode.NotFound, client.signaler("probleme", 42, jeton).status)
+        assertEquals(HttpStatusCode.BadRequest, client.signaler("vote", 1, jeton).status)
+        assertEquals(HttpStatusCode.BadRequest, client.signaler("devoir", 1, jeton, "  ").status)
+    }
+
+    @Test
+    fun `supprimer un contenu purge ses signalements`() = testApplication {
+        application { avecStockageTemporaire(jetonAdmin = "clé-de-modération") }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jeton)
+
+        assertEquals(HttpStatusCode.Created, client.signaler("devoir", id, jeton).status)
+        assertEquals(HttpStatusCode.NoContent, client.supprimer("/devoirs/$id", "clé-de-modération").status)
+        assertFalse(client.get("/signalements").bodyAsText().contains("cible"))
+    }
+
+    @Test
+    fun `les signalements survivent à un rechargement`() {
+        val fichier = File.createTempFile("test", ".json")
+        fichier.delete()
+        val s1 = Stockage(fichier)
+        s1.devoirs.add(Devoir(1, "auteur-jeton", "Maths", "x", null, 0, 0))
+        assertNotNull(s1.signaler("signalant", "devoir", 1, "abus"))
+        assertNull(s1.signaler("signalant", "devoir", 1, "abus"), "un seul signalement par couple")
+        s1.sauvegarder()
+
+        val s2 = Stockage(fichier)
+        s2.charger()
+        assertEquals(1, s2.signalements.size)
+        assertEquals("devoir", s2.signalements.single().cible)
+        assertTrue(s2.supprimerDevoir(1))
+        assertTrue(s2.signalements.isEmpty(), "le signalement suit la suppression de sa cible")
+        s2.sauvegarder()
+
+        val s3 = Stockage(fichier)
+        s3.charger()
+        assertTrue(s3.signalements.isEmpty())
+        assertTrue(s3.devoirs.isEmpty())
         fichier.delete()
     }
 }

@@ -9,6 +9,8 @@ l'API Boti de l'école. Il héberge les contributions des parents et élèves :
   salle erronée…), visible par tous les parents.
 - **Corrections d'emploi du temps** — proposer une correction rattachée à un
   signalement.
+- **Signalements d'abus** — signaler un contenu (devoir, problème, correction)
+  pour qu'un modérateur le retire.
 
 ## Authentification : jeton de mots
 
@@ -34,6 +36,28 @@ Les jetons d'auteur ne figurent jamais dans une réponse : `GET /devoirs`,
 `auteur`, ce qui empêche d'identifier (ou de deviner) un compte à partir des
 listes publiques.
 
+Toute écriture n'accepte que deux jetons : un jeton délivré par `POST /compte`
+(ou le jeton de modération). Un jeton révoqué ou inconnu reçoit `401`.
+
+## Suppression et modération
+
+La suppression est **physique** : le fichier JSON est réécrit sans l'élément,
+ses votes et ses signalements compris.
+
+- `DELETE /devoirs/{id}`, `DELETE /edt/problemes/{id}`,
+  `DELETE /edt/corrections/{id}` — réservés à **l'auteur du jeton**, ou au
+  jeton de modération (`GWS_ADMIN_TOKEN`) qui supprime n'importe quel contenu.
+- `DELETE /compte` — **révoque le jeton** : il ne peut plus rien écrire (ni se
+  supprimer de nouveau). Le contenu qu'il a publié reste en place, à la charge
+  de la modération s'il est indésirable.
+- `POST /signalements` — signale un contenu abusif (`cible` vaut `devoir`,
+  `probleme` ou `correction`) ; `GET /signalements` les liste sans le jeton du
+  signalant. Supprimer la cible purge ses signalements.
+
+Réponses : `204 No Content` si la suppression a réussi, `404` si la cible
+n'existe pas, `403` si vous n'êtes ni l'auteur ni la modération, `401` si le
+jeton est absent, inconnu ou révoqué, `409` si le contenu est déjà signalé.
+
 ## Votes
 
 - Un vote est enregistré par couple `(devoirId, jeton)` : **un jeton ne
@@ -48,14 +72,20 @@ listes publiques.
 | Méthode | Chemin | Auth | Corps |
 |---|---|---|---|
 | POST | `/compte` | — | — |
+| DELETE | `/compte` | jeton | — (révocation définitive) |
 | GET | `/health` | — | — |
 | GET | `/devoirs` | — | — (sans `auteur`) |
 | POST | `/devoirs` | jeton | `{"matière","contenu","dateRemise"?}` |
+| DELETE | `/devoirs/{id}` | auteur ou modération | — |
 | POST | `/devoirs/{id}/vote` | jeton | `{"vote":1 ou -1}` (un vote par jeton, remplace le précédent, pas pour soi-même) |
 | GET | `/edt/problemes` | — | — |
 | POST | `/edt/problemes` | jeton | `{"description","date"}` |
+| DELETE | `/edt/problemes/{id}` | auteur ou modération | — |
 | GET | `/edt/corrections` | — | — |
 | POST | `/edt/corrections` | jeton | `{"problèmeId"?,"description","date"}` |
+| DELETE | `/edt/corrections/{id}` | auteur ou modération | — |
+| GET | `/signalements` | — | — (sans `auteur`) |
+| POST | `/signalements` | jeton | `{"cible","cibleId","raison"}` |
 
 ## Lancer
 
@@ -65,7 +95,9 @@ listes publiques.
 ```
 
 Variables d'environnement : `PORT` (défaut 8080), `GWS_DATA`
-(chemin du fichier de stockage, défaut `data/communaute.json`).
+(chemin du fichier de stockage, défaut `data/communaute.json`),
+`GWS_ADMIN_TOKEN` (jeton de modération autorisé à supprimer n'importe quel
+contenu ; sans cette variable, aucun jeton n'a ce droit).
 
 ## Déploiement
 
