@@ -199,6 +199,20 @@ data class Devoir(
     val crééÀ: Long,
 )
 
+/** Vue publique d'un devoir : le jeton de l'auteur n'en fait jamais partie,
+ *  il permettrait d'identifier (et de deviner) un compte. */
+@Serializable
+data class DevoirPublic(
+    val id: Long,
+    val matière: String,
+    val contenu: String,
+    val dateRemise: String? = null,
+    val votes: Int,               // sans défaut : toujours sérialisé, même à 0
+    val crééÀ: Long,
+)
+
+fun Devoir.public() = DevoirPublic(id, matière, contenu, dateRemise, votes, crééÀ)
+
 @Serializable
 data class DevoirEntrée(val matière: String, val contenu: String, val dateRemise: String? = null)
 
@@ -245,7 +259,23 @@ class Stockage(private val fichier: File) {
     val corrections = mutableListOf<Correction>()
     val comptes = mutableSetOf<String>() // jetons connus
 
+    /** Votes enregistrés : devoirId → jeton → valeur (+1 ou -1). Un jeton n'a
+     *  qu'un vote par devoir ; un second vote remplace le précédent. */
+    val votes = mutableMapOf<Long, MutableMap<String, Int>>()
+
     fun id() = idSuivant.getAndIncrement()
+
+    /** Enregistre le vote d'un jeton sur un devoir et renvoie le devoir mis à
+     *  jour. Le total est ajusté de l'écart avec le vote précédent éventuel. */
+    fun voter(devoirId: Long, jeton: String, vote: Int): Devoir = verrou.write {
+        val indice = devoirs.indexOfFirst { it.id == devoirId }
+        val devoir = devoirs[indice]
+        val écart = vote - (votes[devoirId]?.get(jeton) ?: 0)
+        val modifié = devoir.copy(votes = devoir.votes + écart)
+        devoirs[indice] = modifié
+        votes.getOrPut(devoirId) { mutableMapOf() }[jeton] = vote
+        modifié
+    }
 
     fun charger() {
         if (!fichier.exists()) return
@@ -256,6 +286,8 @@ class Stockage(private val fichier: File) {
                 problèmes.clear(); problèmes.addAll(état.problèmes)
                 corrections.clear(); corrections.addAll(état.corrections)
                 comptes.clear(); comptes.addAll(état.comptes)
+                votes.clear()
+                état.votes.forEach { (id, parJeton) -> votes[id] = parJeton.toMutableMap() }
                 idSuivant.set(état.idSuivant)
             }
         }
@@ -268,6 +300,7 @@ class Stockage(private val fichier: File) {
                 problèmes = problèmes.toList(),
                 corrections = corrections.toList(),
                 comptes = comptes.toList(),
+                votes = votes.mapValues { (_, parJeton) -> parJeton.toMap() },
                 idSuivant = idSuivant.get(),
             )
             fichier.writeText(json.encodeToString(état))
@@ -280,6 +313,7 @@ class Stockage(private val fichier: File) {
         val problèmes: List<Problème> = emptyList(),
         val corrections: List<Correction> = emptyList(),
         val comptes: List<String> = emptyList(),
+        val votes: Map<Long, Map<String, Int>> = emptyMap(),
         val idSuivant: Long = 1,
     )
 }
@@ -303,8 +337,9 @@ fun Application.module(stockage: Stockage) {
             call.respond(HttpStatusCode.Created, Compte(jeton))
         }
 
-        // Suggestions de devoirs
-        get("/devoirs") { call.respond(stockage.devoirs) }
+        // Suggestions de devoirs — les réponses publiques ne portent jamais
+        // le jeton de l'auteur, qui permettrait d'identifier un compte.
+        get("/devoirs") { call.respond(stockage.devoirs.map { it.public() }) }
         post("/devoirs") {
             val jeton = call.jeton() ?: return@post call.respond(
                 HttpStatusCode.Unauthorized, "Fournis le jeton : « Authorization: Bearer <jeton> »")
@@ -318,8 +353,9 @@ fun Application.module(stockage: Stockage) {
             )
             stockage.devoirs.add(devoir)
             stockage.sauvegarder()
-            call.respond(HttpStatusCode.Created, devoir)
+            call.respond(HttpStatusCode.Created, devoir.public())
         }
+        // Un vote par jeton et par devoir : un second vote remplace le premier.
         post("/devoirs/{id}/vote") {
             val jeton = call.jeton() ?: return@post call.respond(HttpStatusCode.Unauthorized, "Jeton requis")
             val id = call.parameters["id"]?.toLongOrNull()
@@ -333,10 +369,9 @@ fun Application.module(stockage: Stockage) {
             if (devoir.auteur == jeton) {
                 return@post call.respond(HttpStatusCode.Forbidden, "on ne vote pas pour sa propre suggestion")
             }
-            val modifié = devoir.copy(votes = devoir.votes + vote)
-            stockage.devoirs[stockage.devoirs.indexOf(devoir)] = modifié
+            val modifié = stockage.voter(id, jeton, vote)
             stockage.sauvegarder()
-            call.respond(modifié)
+            call.respond(modifié.public())
         }
 
         // Signalements d'emploi du temps
