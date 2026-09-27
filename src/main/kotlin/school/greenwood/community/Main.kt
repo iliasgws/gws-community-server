@@ -15,8 +15,10 @@ import io.ktor.server.plugins.origin
 import io.ktor.server.plugins.ratelimit.RateLimit
 import io.ktor.server.plugins.ratelimit.RateLimitName
 import io.ktor.server.plugins.ratelimit.rateLimit
+import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.receive
 import io.ktor.server.request.receiveChannel
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.delete
@@ -31,7 +33,10 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.security.MessageDigest
 import java.security.SecureRandom
+import java.text.Normalizer
+import java.util.HexFormat
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
@@ -214,11 +219,21 @@ data class Devoir(
     val crééÀ: Long,
 )
 
+/** Identifiant pseudonyme stable d'un auteur : les listes publiques le
+ *  portent à la place du jeton, ce qui permet de reconnaître les
+ *  contributions d'un même compte sans jamais le rendre lisible — l'empreinte
+ *  tronquée ne se renverse pas dans la pratique (≈ 2×10^14 jetons possibles). */
+fun auteurId(jeton: String): String =
+    HexFormat.of()
+        .formatHex(MessageDigest.getInstance("SHA-256").digest(jeton.toByteArray(Charsets.UTF_8)))
+        .take(16)
+
 /** Vue publique d'un devoir : le jeton de l'auteur n'en fait jamais partie,
  *  il permettrait d'identifier (et de deviner) un compte. */
 @Serializable
 data class DevoirPublic(
     val id: Long,
+    val auteurId: String,
     val matière: String,
     val contenu: String,
     val dateRemise: String? = null,
@@ -226,7 +241,7 @@ data class DevoirPublic(
     val crééÀ: Long,
 )
 
-fun Devoir.public() = DevoirPublic(id, matière, contenu, dateRemise, votes, crééÀ)
+fun Devoir.public() = DevoirPublic(id, auteurId(auteur), matière, contenu, dateRemise, votes, crééÀ)
 
 @Serializable
 data class DevoirEntrée(val matière: String, val contenu: String, val dateRemise: String? = null)
@@ -246,6 +261,34 @@ data class Problème(
 @Serializable
 data class ProblèmeEntrée(val description: String, val date: String)
 
+/** États d'un signalement d'emploi du temps, sans accent comme les routes. */
+const val ÉTAT_OUVERT = "ouvert"
+const val ÉTAT_RÉSOLU = "résolu"
+
+/** Identifiants des signalements auxquels au moins une correction est
+ *  rattachée : aucun état n'est stocké, il est toujours déduit des
+ *  corrections existantes. */
+fun signalementsRésolus(corrections: List<Correction>): Set<Long> =
+    corrections.mapNotNull { it.problèmeId }.toSet()
+
+/** Un signalement est « résolu » dès qu'une correction lui est rattachée. */
+fun Problème.état(résolus: Set<Long>) = if (id in résolus) ÉTAT_RÉSOLU else ÉTAT_OUVERT
+
+/** Vue publique d'un signalement : le jeton de l'auteur n'en fait jamais
+ *  partie, seul son identifiant pseudonyme y figure. */
+@Serializable
+data class ProblèmePublic(
+    val id: Long,
+    val auteurId: String,
+    val description: String,
+    val date: String,            // date concernée (ISO)
+    val état: String,            // ouvert ou résolu, déduit des corrections
+    val crééÀ: Long,
+)
+
+fun Problème.public(résolus: Set<Long> = emptySet()) =
+    ProblèmePublic(id, auteurId(auteur), description, date, état(résolus), crééÀ)
+
 @Serializable
 data class Correction(
     val id: Long,
@@ -255,6 +298,20 @@ data class Correction(
     val date: String,
     val crééÀ: Long,
 )
+
+/** Vue publique d'une correction : le jeton de l'auteur n'en fait jamais
+ *  partie, seul son identifiant pseudonyme y figure. */
+@Serializable
+data class CorrectionPublic(
+    val id: Long,
+    val auteurId: String,
+    val problèmeId: Long? = null,
+    val description: String,
+    val date: String,
+    val crééÀ: Long,
+)
+
+fun Correction.public() = CorrectionPublic(id, auteurId(auteur), problèmeId, description, date, crééÀ)
 
 @Serializable
 data class CorrectionEntrée(val problèmeId: Long? = null, val description: String, val date: String)
@@ -311,6 +368,11 @@ class Stockage(private val fichier: File) {
     val votes = mutableMapOf<Long, MutableMap<String, Int>>()
 
     fun id() = idSuivant.getAndIncrement()
+
+    /** Lecture sous le verrou de lecture : une écriture réécrit les listes
+     *  entières, une lecture concurrente ne doit jamais en voir une à moitié
+     *  modifiée. */
+    fun <T> lecture(opération: Stockage.() -> T): T = verrou.read { opération() }
 
     /** Suppression physique d'un devoir : le fichier JSON est réécrit sans lui,
      *  ses votes et ses signalements sont purgés. Renvoie false si absent. */
@@ -456,6 +518,84 @@ fun originesAutorisées(valeur: String? = System.getenv("GWS_ORIGINS")): List<St
         .filter { it.isNotEmpty() }
         .distinct()
 
+// — Tri, filtres et pagination des listes publiques -------------------------
+
+/** Paramètre de requête mal formé : la route l'abandonne et `StatusPages`
+ *  répond 400 Bad Request. */
+class ParamètreInvalide(message: String) : Exception(message)
+
+/** Pages bornées : la réponse d'une liste ne doit jamais croître
+ *  indéfiniment à mesure que l'on écrit. */
+const val LIMITE_PAR_DÉFAUT = 50
+const val LIMITE_MAXIMALE = 500
+
+/** Tris disponibles sur les devoirs, valeur de `?tri=` sans accent. */
+val TRIS_DEVOIRS = mapOf(
+    // Les plus votés d'abord, puis les plus récents ; les ex æquo suivent
+    // l'identifiant, donc l'ordre d'insertion — jamais stable au hasard.
+    "votes" to compareByDescending<Devoir> { it.votes }
+        .thenByDescending { it.crééÀ }
+        .thenByDescending { it.id },
+    "recent" to compareByDescending<Devoir> { it.crééÀ }.thenByDescending { it.id },
+)
+
+/** Listes chronologiques : les nouveautés en tête, ex æquo par identifiant. */
+val TRI_CHRONOLOGIQUE_PROBLÈMES = compareByDescending<Problème> { it.crééÀ }.thenByDescending { it.id }
+val TRI_CHRONOLOGIQUE_CORRECTIONS = compareByDescending<Correction> { it.crééÀ }.thenByDescending { it.id }
+
+/** Valeurs acceptées par `?etat=`, sans accent : la comparaison se fait
+ *  après normalisation, comme pour tous les paramètres d'énumération. */
+val ÉTATS = setOf(ÉTAT_OUVERT.normalisé(), ÉTAT_RÉSOLU.normalisé())
+
+/** Comparaison sans casse ni accent : « Récent », « recent » et « RECENT »
+ *  désignent le même tri, « Maths » et « MATHS » la même matière. */
+fun String.normalisé(): String =
+    Normalizer.normalize(this, Normalizer.Form.NFD)
+        .replace(Regex("\\p{M}+"), "")
+        .lowercase()
+
+/** Premier paramètre de requête non vide parmi [noms] ; l'accent du nom est
+ *  facultatif côté client (« matière » ou « matiere »). */
+private fun io.ktor.server.routing.RoutingCall.paramètre(vararg noms: String): String? =
+    noms.firstNotNullOfOrNull { nom ->
+        request.queryParameters[nom]?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+/** Paramètre entier, [défaut] s'il est absent ; hors bornes ou non entier →
+ *  400. */
+private fun io.ktor.server.routing.RoutingCall.entier(
+    vararg noms: String,
+    défaut: Int,
+    min: Int = 0,
+    max: Int = Int.MAX_VALUE,
+): Int {
+    val brut = paramètre(*noms) ?: return défaut
+    val valeur = brut.toIntOrNull() ?: throw ParamètreInvalide("${noms.first()} invalide : $brut")
+    if (valeur < min || valeur > max) {
+        throw ParamètreInvalide("${noms.first()} hors bornes ($min à $max)")
+    }
+    return valeur
+}
+
+/** Paramètre entier optionnel : absent = aucun filtre, mal formé = 400. */
+private fun io.ktor.server.routing.RoutingCall.entierOptionnel(
+    vararg noms: String,
+    min: Long = 0,
+    max: Long = Long.MAX_VALUE,
+): Long? {
+    val brut = paramètre(*noms) ?: return null
+    val valeur = brut.toLongOrNull() ?: throw ParamètreInvalide("${noms.first()} invalide : $brut")
+    if (valeur < min || valeur > max) {
+        throw ParamètreInvalide("${noms.first()} hors bornes ($min à $max)")
+    }
+    return valeur
+}
+
+/** `?depuis=` : époque en millisecondes ; une valeur plus petite que 10^11 —
+ *  atteinte en secondes jusqu'en 5138, en millisecondes seulement depuis
+ *  mars 1973 — est prise pour des secondes. */
+private fun Long.enMillisecondes() = if (this < 100_000_000_000L) this * 1000 else this
+
 fun Application.module(
     stockage: Stockage,
     jetonAdmin: String? = System.getenv("GWS_ADMIN_TOKEN"),
@@ -463,6 +603,14 @@ fun Application.module(
     origines: Collection<String> = originesAutorisées(),
 ) {
     install(ContentNegotiation) { json() }
+
+    // Un paramètre de requête mal formé (`?limite=vingt`) ne doit pas
+    // déclencher une 500 : la route l'abandonne en lançant ParamètreInvalide.
+    install(StatusPages) {
+        exception<ParamètreInvalide> { call, cause ->
+            call.respond(HttpStatusCode.BadRequest, cause.message ?: "paramètre invalide")
+        }
+    }
 
     // Un appel de navigateur depuis une autre origine (application parente,
     // portail élève, page statique hébergée ailleurs) déclenche un pré-vol
@@ -478,6 +626,9 @@ fun Application.module(
         // condition pour que « application/json » soit accepté au pré-vol.
         allowHeader(HttpHeaders.Authorization)
         allowHeader(HttpHeaders.ContentType)
+        // Sans cette ligne un navigateur externe ne peut pas lire le nombre
+        // d'éléments d'une liste, l'en-tête restant masqué par défaut.
+        exposeHeader(HttpHeaders.XTotalCount)
         allowCredentials = false   // authentification par jeton, jamais par cookie
     }
 
@@ -513,15 +664,76 @@ fun Application.module(
         get("/health") { call.respondText("OK") }
 
         // Les lectures ne réécrivent rien : aucune limitation de débit.
-        // Suggestions de devoirs — les réponses publiques ne portent jamais
-        // le jeton de l'auteur, qui permettrait d'identifier un compte.
-        get("/devoirs") { call.respond(stockage.devoirs.map { it.public() }) }
+        // Suggestions de devoirs — tri, filtres et pagination ; la réponse ne
+        // porte jamais le jeton de l'auteur, seulement son identifiant
+        // pseudonyme (voir #1 et #5).
+        get("/devoirs") {
+            val tri = (call.paramètre("tri") ?: "votes").normalisé()
+            if (tri !in TRIS_DEVOIRS) throw ParamètreInvalide("tri doit valoir votes ou récent")
+            val matière = call.paramètre("matière", "matiere")
+            val depuis = call.entierOptionnel("depuis")?.enMillisecondes()
+            val limite = call.entier("limite", défaut = LIMITE_PAR_DÉFAUT, min = 1, max = LIMITE_MAXIMALE)
+            val offset = call.entier("offset", défaut = 0)
 
-        // Signalements d'emploi du temps
-        get("/edt/problemes") { call.respond(stockage.problèmes) }
+            val (page, total) = stockage.lecture {
+                val retenus = devoirs.filter { devoir ->
+                    (matière == null || devoir.matière.normalisé() == matière.normalisé()) &&
+                        (depuis == null || devoir.crééÀ >= depuis)
+                }
+                retenus.sortedWith(TRIS_DEVOIRS.getValue(tri))
+                    .drop(offset).take(limite).map { it.public() } to retenus.size
+            }
+            call.response.header(HttpHeaders.XTotalCount, total.toString())
+            call.respond(page)
+        }
 
-        // Corrections proposées pour l'emploi du temps
-        get("/edt/corrections") { call.respond(stockage.corrections) }
+        // Signalements d'emploi du temps — filtrables par date et par état ;
+        // « résolu » signale au moins une correction rattachée au problème.
+        get("/edt/problemes") {
+            val date = call.paramètre("date")
+            val état = call.paramètre("etat", "état")?.normalisé()
+            if (état != null && état !in ÉTATS) {
+                throw ParamètreInvalide("etat doit valoir ouvert ou résolu")
+            }
+            val depuis = call.entierOptionnel("depuis")?.enMillisecondes()
+            val limite = call.entier("limite", défaut = LIMITE_PAR_DÉFAUT, min = 1, max = LIMITE_MAXIMALE)
+            val offset = call.entier("offset", défaut = 0)
+
+            val (page, total) = stockage.lecture {
+                val résolus = signalementsRésolus(corrections)
+                val retenus = problèmes.filter { problème ->
+                    (date == null || problème.date == date) &&
+                        (depuis == null || problème.crééÀ >= depuis) &&
+                        (état == null || problème.état(résolus).normalisé() == état)
+                }
+                retenus.sortedWith(TRI_CHRONOLOGIQUE_PROBLÈMES)
+                    .drop(offset).take(limite).map { it.public(résolus) } to retenus.size
+            }
+            call.response.header(HttpHeaders.XTotalCount, total.toString())
+            call.respond(page)
+        }
+
+        // Corrections proposées pour l'emploi du temps — filtrables par
+        // signalement rattaché et par date.
+        get("/edt/corrections") {
+            val problèmeId = call.entierOptionnel("problèmeId", "problemeId", min = 1)
+            val date = call.paramètre("date")
+            val depuis = call.entierOptionnel("depuis")?.enMillisecondes()
+            val limite = call.entier("limite", défaut = LIMITE_PAR_DÉFAUT, min = 1, max = LIMITE_MAXIMALE)
+            val offset = call.entier("offset", défaut = 0)
+
+            val (page, total) = stockage.lecture {
+                val retenus = corrections.filter { correction ->
+                    (problèmeId == null || correction.problèmeId == problèmeId) &&
+                        (date == null || correction.date == date) &&
+                        (depuis == null || correction.crééÀ >= depuis)
+                }
+                retenus.sortedWith(TRI_CHRONOLOGIQUE_CORRECTIONS)
+                    .drop(offset).take(limite).map { it.public() } to retenus.size
+            }
+            call.response.header(HttpHeaders.XTotalCount, total.toString())
+            call.respond(page)
+        }
 
         // Signalements d'abus : un contenu est signalé à la modération, qui
         // peut ensuite le supprimer. Le jeton du signalant reste secret.
@@ -613,7 +825,7 @@ fun Application.module(
                     val problème = Problème(stockage.id(), jeton, entrée.description, entrée.date, now)
                     stockage.problèmes.add(problème)
                     stockage.sauvegarder()
-                    call.respond(HttpStatusCode.Created, problème)
+                    call.respond(HttpStatusCode.Created, problème.public())
                 }
                 delete("/edt/problemes/{id}") {
                     val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
@@ -645,7 +857,7 @@ fun Application.module(
                     )
                     stockage.corrections.add(correction)
                     stockage.sauvegarder()
-                    call.respond(HttpStatusCode.Created, correction)
+                    call.respond(HttpStatusCode.Created, correction.public())
                 }
                 delete("/edt/corrections/{id}") {
                     val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
