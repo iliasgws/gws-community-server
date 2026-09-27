@@ -67,6 +67,27 @@ jeton est absent, inconnu ou révoqué, `409` si le contenu est déjà signalé.
 - On ne vote pas pour sa propre suggestion : `403 Forbidden`.
 - `vote` n'accepte que `+1` ou `−1`, sinon `400 Bad Request`.
 
+## CORS
+
+Un client embarqué dans une autre origine (application parente, portail
+élève, page statique hébergée ailleurs) appelle le serveur depuis un
+navigateur : le plugin `ktor-server-cors` répond aux pré-vols `OPTIONS` et
+pose les en-têtes attendus.
+
+- **Origines** : la liste `GWS_ORIGINS`, séparées par des virgules ou des
+  espaces (ex. `https://parent.greenwood.example,https://portail.example`).
+  **Sans cette variable, aucune origine n'est admise** : une origine non
+  listée reçoit `403 Forbidden`.
+- **Méthodes** : `GET`, `POST`, `DELETE` — les trois familles de l'API.
+- **En-têtes** : `Authorization` (le jeton) et `Content-Type`
+  (`application/json`).
+- **Pas de cookies** : `allowCredentials = false`, l'authentification reste
+  portée par le jeton `Authorization`.
+
+Un pré-vol abouti répond `200 OK` avec `Access-Control-Allow-Origin`,
+`Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` et
+`Access-Control-Max-Age` (Ktor ne renvoie jamais `204` sur ce point).
+
 ## API
 
 | Méthode | Chemin | Auth | Corps |
@@ -97,7 +118,9 @@ jeton est absent, inconnu ou révoqué, `409` si le contenu est déjà signalé.
 Variables d'environnement : `PORT` (défaut 8080), `GWS_DATA`
 (chemin du fichier de stockage, défaut `data/communaute.json`),
 `GWS_ADMIN_TOKEN` (jeton de modération autorisé à supprimer n'importe quel
-contenu ; sans cette variable, aucun jeton n'a ce droit).
+contenu ; sans cette variable, aucun jeton n'a ce droit),
+`GWS_ORIGINS` (origines autorisées à appeler le serveur depuis un navigateur,
+voir **CORS** ; sans cette variable, aucune origine externe n'est admise).
 
 ## Déploiement
 

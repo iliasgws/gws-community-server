@@ -45,9 +45,21 @@ private suspend fun io.ktor.client.HttpClient.signaler(
 private fun votesDe(corps: String): Int =
     Regex(""""votes":(-?\d+)""").find(corps)!!.groupValues[1].toInt()
 
+private const val ORIGINE = "https://parent.greenwood.example"
+
+/** Pré-vol tel que le navigateur l'envoie avant un appel cross-origin. */
+private suspend fun io.ktor.client.HttpClient.prévol(origine: String, méthode: String = "POST") =
+    options("/devoirs") {
+        header(HttpHeaders.Origin, origine)
+        header(HttpHeaders.AccessControlRequestMethod, méthode)
+        header(HttpHeaders.AccessControlRequestHeaders, "Authorization, Content-Type")
+    }
+
 class ModuleTest {
-    private fun Application.avecStockageTemporaire(jetonAdmin: String? = null) =
-        module(Stockage(File.createTempFile("test", ".json")), jetonAdmin)
+    private fun Application.avecStockageTemporaire(
+        jetonAdmin: String? = null,
+        origines: Collection<String> = emptyList(),
+    ) = module(Stockage(File.createTempFile("test", ".json")), jetonAdmin, origines = origines)
 
     @Test
     fun `health répond OK`() = testApplication {
@@ -513,5 +525,46 @@ class ModuleTest {
         assertTrue(s3.signalements.isEmpty())
         assertTrue(s3.devoirs.isEmpty())
         fichier.delete()
+    }
+
+    // — CORS -----------------------------------------------------------------
+
+    @Test
+    fun `le pré-vol OPTIONS devoirs répond avec les en-têtes CORS`() = testApplication {
+        application { avecStockageTemporaire(origines = listOf(ORIGINE)) }
+        val rep = client.prévol(ORIGINE)
+        assertEquals(HttpStatusCode.OK, rep.status)
+        assertEquals(ORIGINE, rep.headers[HttpHeaders.AccessControlAllowOrigin])
+        val enTêtes = rep.headers[HttpHeaders.AccessControlAllowHeaders].orEmpty()
+            .split(',').map { it.trim().lowercase() }
+        assertTrue("authorization" in enTêtes, "Authorization refusé au pré-vol : $enTêtes")
+        assertTrue("content-type" in enTêtes, "Content-Type refusé au pré-vol : $enTêtes")
+    }
+
+    @Test
+    fun `le pré-vol autorise GET, POST et DELETE`() = testApplication {
+        application { avecStockageTemporaire(origines = listOf(ORIGINE)) }
+        for (méthode in listOf("GET", "POST", "DELETE")) {
+            val rep = client.prévol(ORIGINE, méthode)
+            assertEquals(HttpStatusCode.OK, rep.status, "$méthode refusé au pré-vol")
+        }
+    }
+
+    @Test
+    fun `une origine absente de GWS_ORIGINS est refusée`() = testApplication {
+        application { avecStockageTemporaire(origines = listOf(ORIGINE)) }
+        val rep = client.prévol("https://attaquant.example")
+        assertEquals(HttpStatusCode.Forbidden, rep.status)
+        assertNull(rep.headers[HttpHeaders.AccessControlAllowOrigin])
+    }
+
+    @Test
+    fun `GWS_ORIGINS accepte plusieurs séparateurs et ignore les vides`() {
+        assertEquals(
+            listOf("https://a.example", "http://b.example:5173"),
+            originesAutorisées("https://a.example , http://b.example:5173/ ;\n\thttps://a.example"),
+        )
+        assertEquals(emptyList(), originesAutorisées(null), "sans variable, aucune origine")
+        assertEquals(emptyList(), originesAutorisées("   "))
     }
 }
