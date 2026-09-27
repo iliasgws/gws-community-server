@@ -32,9 +32,14 @@ Authorization: Bearer eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse
 Le serveur ne reçoit jamais de nom ; les lectures sont publiques.
 
 Les jetons d'auteur ne figurent jamais dans une réponse : `GET /devoirs`,
-`POST /devoirs` et `POST /devoirs/{id}/vote` renvoient un devoir sans champ
-`auteur`, ce qui empêche d'identifier (ou de deviner) un compte à partir des
-listes publiques.
+`GET /edt/problemes`, `GET /edt/corrections`, `POST /devoirs` et
+`POST /devoirs/{id}/vote` renvoient leurs contenus sans champ `auteur`, ce
+qui empêche d'identifier (ou de deviner) un compte à partir des listes
+publiques. À la place, chaque contenu porte **`auteurId`** : un identifiant
+pseudonyme stable, obtenu par empreinte tronquée du jeton, qui permet de
+reconnaître les contributions d'un même compte — les signatures « même auteur »
+— sans jamais exposer le jeton lui-même. Un même compte a toujours le même
+`auteurId`, sur toutes les listes.
 
 Toute écriture n'accepte que deux jetons : un jeton délivré par `POST /compte`
 (ou le jeton de modération). Un jeton révoqué ou inconnu reçoit `401`.
@@ -88,6 +93,36 @@ Un pré-vol abouti répond `200 OK` avec `Access-Control-Allow-Origin`,
 `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` et
 `Access-Control-Max-Age` (Ktor ne renvoie jamais `204` sur ce point).
 
+## Tri, filtres et pagination
+
+Les trois listes publiques se lisent avec des paramètres d'URL (facultatifs,
+valeurs sans accent acceptées : `matiere` = `matière`, `recent` = `récent`).
+Une valeur mal formée répond `400 Bad Request` — jamais une page vide prise
+pour un résultat.
+
+| Paramètre | Routes | Effet |
+|---|---|---|
+| `tri=votes\|récent` | `/devoirs` | **`votes` par défaut** : votes décroissants, puis `crééÀ` décroissants ; `récent` : `crééÀ` décroissant |
+| `matière=…` | `/devoirs` | filtre exact sur la matière, casse et accents ignorés |
+| `date=AAAA-MM-JJ` | `/edt/problemes`, `/edt/corrections` | filtre exact sur la date concernée |
+| `etat=ouvert\|résolu` | `/edt/problemes` | `résolu` = au moins une correction rattachée au signalement (état déduit, jamais stocké) |
+| `problèmeId=…` | `/edt/corrections` | ne renvoie que les corrections d'un signalement |
+| `depuis=<époque>` | les trois | ne renvoie que les nouveautés ; millisecondes, ou secondes si la valeur est plus petite que 10¹¹ |
+| `limite=…&offset=…` | les trois | pagination, `limite` par défaut **50** (maximum 500), `offset` à 0 |
+
+Chaque réponse porte l'en-tête **`X-Total-Count`** : nombre d'éléments après
+filtres mais **avant** pagination — de quoi afficher « 12 résultats, page 1
+sur 1 » sans rappeler la liste. Les listes sont toujours triées, jamais dans
+l'ordre d'insertion brut : les votes ont donc un effet visible sur
+l'affichage.
+
+```
+GET /devoirs?tri=votes&matière=SVT&limite=20&offset=0
+GET /devoirs?depuis=1790000000000        → uniquement les nouveautés
+GET /edt/problemes?date=2026-09-28&etat=ouvert
+GET /edt/corrections?problèmeId=42
+```
+
 ## API
 
 | Méthode | Chemin | Auth | Corps |
@@ -95,14 +130,14 @@ Un pré-vol abouti répond `200 OK` avec `Access-Control-Allow-Origin`,
 | POST | `/compte` | — | — |
 | DELETE | `/compte` | jeton | — (révocation définitive) |
 | GET | `/health` | — | — |
-| GET | `/devoirs` | — | — (sans `auteur`) |
+| GET | `/devoirs` | — | — (`?tri`, `?matière`, `?depuis`, `?limite`, `?offset`, `X-Total-Count`, sans `auteur`) |
 | POST | `/devoirs` | jeton | `{"matière","contenu","dateRemise"?}` |
 | DELETE | `/devoirs/{id}` | auteur ou modération | — |
 | POST | `/devoirs/{id}/vote` | jeton | `{"vote":1 ou -1}` (un vote par jeton, remplace le précédent, pas pour soi-même) |
-| GET | `/edt/problemes` | — | — |
+| GET | `/edt/problemes` | — | — (`?date`, `?etat`, `?depuis`, `?limite`, `?offset`, `X-Total-Count`, sans `auteur`) |
 | POST | `/edt/problemes` | jeton | `{"description","date"}` |
 | DELETE | `/edt/problemes/{id}` | auteur ou modération | — |
-| GET | `/edt/corrections` | — | — |
+| GET | `/edt/corrections` | — | — (`?problèmeId`, `?date`, `?depuis`, `?limite`, `?offset`, `X-Total-Count`, sans `auteur`) |
 | POST | `/edt/corrections` | jeton | `{"problèmeId"?,"description","date"}` |
 | DELETE | `/edt/corrections/{id}` | auteur ou modération | — |
 | GET | `/signalements` | — | — (sans `auteur`) |

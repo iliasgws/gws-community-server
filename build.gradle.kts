@@ -17,6 +17,7 @@ dependencies {
     implementation("io.ktor:ktor-server-content-negotiation:3.3.1")
     implementation("io.ktor:ktor-server-cors:3.3.1")
     implementation("io.ktor:ktor-server-rate-limit:3.3.1")
+    implementation("io.ktor:ktor-server-status-pages:3.3.1")
     implementation("io.ktor:ktor-serialization-kotlinx-json:3.3.1")
     implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.7.1")
     implementation("org.slf4j:slf4j-simple:2.0.17")
