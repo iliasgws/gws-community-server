@@ -316,8 +316,10 @@ fun Correction.public() = CorrectionPublic(id, auteurId(auteur), problèmeId, de
 @Serializable
 data class CorrectionEntrée(val problèmeId: Long? = null, val description: String, val date: String)
 
+/** Compte nouvellement créé : le jeton, et la version de la notice à afficher
+ *  avant la première écriture. Sans défaut, sinon `encodeDefaults` la tait. */
 @Serializable
-data class Compte(val jeton: String)
+data class Compte(val jeton: String, val mentionsVersion: String)
 
 /** Signalement d'abus : un contenu (devoir, problème ou correction) est
  *  signalé à la modération. */
@@ -663,6 +665,11 @@ fun Application.module(
     routing {
         get("/health") { call.respondText("OK") }
 
+        // Mentions légales et politique de confidentialité : publiques, afin
+        // que chaque client affiche la notice courante avant la première
+        // écriture (la version renvoyée par POST /compte invalide son cache).
+        get("/mentions") { call.respond(MENTIONS) }
+
         // Les lectures ne réécrivent rien : aucune limitation de débit.
         // Suggestions de devoirs — tri, filtres et pagination ; la réponse ne
         // porte jamais le jeton de l'auteur, seulement son identifiant
@@ -748,7 +755,7 @@ fun Application.module(
                     val jeton = générerJeton()
                     stockage.comptes.add(jeton)
                     stockage.sauvegarder()
-                    call.respond(HttpStatusCode.Created, Compte(jeton))
+                    call.respond(HttpStatusCode.Created, Compte(jeton, MENTIONS.version))
                 }
             }
         }

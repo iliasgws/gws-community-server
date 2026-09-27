@@ -567,4 +567,49 @@ class ModuleTest {
         assertEquals(emptyList(), originesAutorisées(null), "sans variable, aucune origine")
         assertEquals(emptyList(), originesAutorisées("   "))
     }
+
+    // — Mentions -------------------------------------------------------------
+
+    @Test
+    fun `la route mentions est publique et couvre les cinq sections`() = testApplication {
+        application { avecStockageTemporaire() }
+        val rep = client.get("/mentions")
+        assertEquals(HttpStatusCode.OK, rep.status)
+        val corps = rep.bodyAsText()
+        assertTrue(corps.contains(""""version":"$VERSION_MENTIONS""""))
+        for (id in listOf("editeur", "donnees", "usage", "moderation", "droits")) {
+            assertTrue(corps.contains(""""id":"$id""""), "section $id absente de $corps")
+        }
+        assertFalse(corps.contains("\"jeton\":"), "la notice ne référence aucun jeton")
+    }
+
+    @Test
+    fun `la version des mentions suit le format AAAA-MM-JJ`() =
+        assertTrue(Regex("""^\d{4}-\d{2}-\d{2}$""").matches(VERSION_MENTIONS), VERSION_MENTIONS)
+
+    @Test
+    fun `créer un compte annonce la version des mentions`() = testApplication {
+        application { avecStockageTemporaire() }
+        val rep = client.post("/compte")
+        val version = Regex(""""mentionsVersion":"([^"]+)"""").find(rep.bodyAsText())!!.groupValues[1]
+        assertEquals(VERSION_MENTIONS, version, "le client doit pouvoir invalider son cache")
+        assertEquals(version, client.get("/mentions").bodyAsText()
+            .let { Regex(""""version":"([^"]+)"""").find(it)!!.groupValues[1] })
+    }
+
+    @Test
+    fun `le contact de la notice vient de l'environnement, jamais inventé`() {
+        val éditeurDe = { c: String? -> mentions(c).sections.first { it.id == "editeur" }.texte }
+        assertFalse(éditeurDe(null).contains("Contact"), "aucun contact sans GWS_CONTACT")
+        assertFalse(éditeurDe("  ").contains("Contact"), "contact vide ignoré")
+        assertTrue(éditeurDe("bureau@greenwood.example").contains("Contact : bureau@greenwood.example"))
+    }
+
+    @Test
+    fun `la notice rappelle l'essentiel de la confidentialité`() {
+        val parId = mentions(null).sections.associateBy { it.id }
+        assertTrue(parId.getValue("donnees").texte.contains("Aucun nom"))
+        assertTrue(parId.getValue("usage").texte.contains("donnée personnelle"))
+        assertTrue(parId.getValue("moderation").texte.contains("suppression est physique"))
+    }
 }
