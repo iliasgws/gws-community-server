@@ -18,8 +18,13 @@ Aucun compte, aucun mot de passe, aucune donnée personnelle. À la première
 utilisation, le client appelle :
 
 ```
-POST /compte   →   {"jeton":"eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse"}
+POST /compte   →   {"jeton":"eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse",
+                    "mentionsVersion":"2026-09-27"}
 ```
+
+`mentionsVersion` est la date de la notice à présenter avant la première
+écriture (voir **Mentions** plus bas) : un client qui garde la notice en
+local la compare à celle-ci pour savoir si sa copie est périmée.
 
 Le jeton — six mots tirés d'une liste de 243, soit ≈ 2×10¹⁴ combinaisons —
 sert à la fois d'identité et d'identifiant d'affichage. Chaque requête
@@ -123,13 +128,42 @@ GET /edt/problemes?date=2026-09-28&etat=ouvert
 GET /edt/corrections?problèmeId=42
 ```
 
+## Mentions
+
+`GET /mentions` (publique, sans jeton) renvoie la notice d'information et de
+confidentialité, à afficher avant la première écriture :
+
+```json
+{
+  "version": "2026-09-27",
+  "sections": [
+    {"id":"editeur","titre":"Éditeur","texte":"…"},
+    {"id":"donnees","titre":"Données collectées","texte":"…"},
+    {"id":"usage","titre":"Règles d'usage","texte":"…"},
+    {"id":"moderation","titre":"Modération et suppression","texte":"…"},
+    {"id":"droits","titre":"Vos droits","texte":"…"}
+  ]
+}
+```
+
+- La notice est **servie par le serveur** : tous les clients affichent la
+  même version, sans duplication du texte.
+- `version` suit le format `AAAA-MM-JJ` et **ne change que si le texte
+  change** ; `POST /compte` renvoie la même valeur dans `mentionsVersion`,
+  ce qui permet d'invalider une copie locale. Si l'utilisateur refuse, le
+  client peut appeler `DELETE /compte` — le jeton est révoqué.
+- Aucun nom ni adresse n'est inventé : le contact de la section « Éditeur »
+  provient de la variable `GWS_CONTACT`, et la section le mentionne
+  uniquement si elle est définie.
+
 ## API
 
 | Méthode | Chemin | Auth | Corps |
 |---|---|---|---|
-| POST | `/compte` | — | — |
+| POST | `/compte` | — | — (→ `jeton`, `mentionsVersion`) |
 | DELETE | `/compte` | jeton | — (révocation définitive) |
 | GET | `/health` | — | — |
+| GET | `/mentions` | — | — (notice, cinq sections) |
 | GET | `/devoirs` | — | — (`?tri`, `?matière`, `?depuis`, `?limite`, `?offset`, `X-Total-Count`, sans `auteur`) |
 | POST | `/devoirs` | jeton | `{"matière","contenu","dateRemise"?}` |
 | DELETE | `/devoirs/{id}` | auteur ou modération | — |
@@ -155,7 +189,10 @@ Variables d'environnement : `PORT` (défaut 8080), `GWS_DATA`
 `GWS_ADMIN_TOKEN` (jeton de modération autorisé à supprimer n'importe quel
 contenu ; sans cette variable, aucun jeton n'a ce droit),
 `GWS_ORIGINS` (origines autorisées à appeler le serveur depuis un navigateur,
-voir **CORS** ; sans cette variable, aucune origine externe n'est admise).
+voir **CORS** ; sans cette variable, aucune origine externe n'est admise),
+`GWS_CONTACT` (contact affiché dans la section « Éditeur » des `GET /mentions`
+— recommandé en production, faute de quoi la notice ne donne aucun moyen de
+contact).
 
 ## Déploiement
 
