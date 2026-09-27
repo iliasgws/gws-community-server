@@ -1,6 +1,7 @@
 package school.greenwood.community
 
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -9,6 +10,7 @@ import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.plugins.origin
 import io.ktor.server.plugins.ratelimit.RateLimit
 import io.ktor.server.plugins.ratelimit.RateLimitName
@@ -440,12 +442,44 @@ data class Limites(
     val inscriptionParJour: Int = 100,   // comptes / 24 h / IP
 )
 
+// — CORS ---------------------------------------------------------------------
+
+/** Origines autorisées à appeler le serveur depuis un navigateur, lues dans
+ *  « GWS_ORIGINS » : une liste d'origines (`https://host[:port]`) séparées
+ *  par des virgules, des points-virgules ou des espaces. Sans variable — ou
+ *  avec une valeur vide — aucune origine n'est autorisée : le serveur n'est
+ *  pas une API publique, on n'ouvre le cross-origin que sur demande. */
+fun originesAutorisées(valeur: String? = System.getenv("GWS_ORIGINS")): List<String> =
+    valeur.orEmpty()
+        .split(',', ';', ' ', '\n', '\t')
+        .map { it.trim().trimEnd('/') }
+        .filter { it.isNotEmpty() }
+        .distinct()
+
 fun Application.module(
     stockage: Stockage,
     jetonAdmin: String? = System.getenv("GWS_ADMIN_TOKEN"),
     limites: Limites = Limites(),
+    origines: Collection<String> = originesAutorisées(),
 ) {
     install(ContentNegotiation) { json() }
+
+    // Un appel de navigateur depuis une autre origine (application parente,
+    // portail élève, page statique hébergée ailleurs) déclenche un pré-vol
+    // OPTIONS : sans ce plugin il recevait 404, et sans en-tête
+    // Access-Control-Allow-Origin la réponse était rejetée côté client.
+    install(CORS) {
+        val autorisées = origines.toSet()
+        if (autorisées.isNotEmpty()) allowOrigins { it in autorisées }
+        allowMethod(HttpMethod.Get)
+        allowMethod(HttpMethod.Post)
+        allowMethod(HttpMethod.Delete)
+        // Content-Type aussi : le plugin le signale alors comme non simple,
+        // condition pour que « application/json » soit accepté au pré-vol.
+        allowHeader(HttpHeaders.Authorization)
+        allowHeader(HttpHeaders.ContentType)
+        allowCredentials = false   // authentification par jeton, jamais par cookie
+    }
 
     install(RateLimit) {
         // Écritures : un budget par jeton (ou par IP, faute de jeton), puis un
