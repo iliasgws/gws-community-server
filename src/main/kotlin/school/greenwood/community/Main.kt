@@ -30,17 +30,12 @@ import kotlinx.io.readByteArray
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.text.Normalizer
 import java.util.HexFormat
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.ReentrantReadWriteLock
-import kotlin.concurrent.read
-import kotlin.concurrent.write
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
 
@@ -265,14 +260,14 @@ data class ProblèmeEntrée(val description: String, val date: String)
 const val ÉTAT_OUVERT = "ouvert"
 const val ÉTAT_RÉSOLU = "résolu"
 
-/** Identifiants des signalements auxquels au moins une correction est
- *  rattachée : aucun état n'est stocké, il est toujours déduit des
- *  corrections existantes. */
-fun signalementsRésolus(corrections: List<Correction>): Set<Long> =
-    corrections.mapNotNull { it.problèmeId }.toSet()
+/** Un signalement est « résolu » dès qu'une correction lui est rattachée :
+ *  l'état n'est jamais stocké, il est déduit à chaque lecture. */
+fun Problème.état(résolu: Boolean) = if (résolu) ÉTAT_RÉSOLU else ÉTAT_OUVERT
 
-/** Un signalement est « résolu » dès qu'une correction lui est rattachée. */
-fun Problème.état(résolus: Set<Long>) = if (id in résolus) ÉTAT_RÉSOLU else ÉTAT_OUVERT
+/** Un signalement d'emploi du temps et l'état déduit qui l'accompagne. */
+data class ProblèmeAvecÉtat(val problème: Problème, val résolu: Boolean) {
+    fun public() = problème.public(résolu)
+}
 
 /** Vue publique d'un signalement : le jeton de l'auteur n'en fait jamais
  *  partie, seul son identifiant pseudonyme y figure. */
@@ -286,8 +281,8 @@ data class ProblèmePublic(
     val crééÀ: Long,
 )
 
-fun Problème.public(résolus: Set<Long> = emptySet()) =
-    ProblèmePublic(id, auteurId(auteur), description, date, état(résolus), crééÀ)
+fun Problème.public(résolu: Boolean = false) =
+    ProblèmePublic(id, auteurId(auteur), description, date, état(résolu), crééÀ)
 
 @Serializable
 data class Correction(
@@ -352,150 +347,14 @@ data class SignalementEntrée(val cible: String, val cibleId: Long, val raison: 
 /** Cibles qu'un signalement peut viser, sans accent comme les routes. */
 val CIBLES = setOf("devoir", "probleme", "correction")
 
-// — Stockage (fichier JSON, sauvegarde après chaque écriture) ---------------
-
-class Stockage(private val fichier: File) {
-    private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
-    private val verrou = ReentrantReadWriteLock()
-    private val idSuivant = AtomicLong(1)
-
-    val devoirs = mutableListOf<Devoir>()
-    val problèmes = mutableListOf<Problème>()
-    val corrections = mutableListOf<Correction>()
-    val comptes = mutableSetOf<String>() // jetons connus
-    val signalements = mutableListOf<Signalement>()
-
-    /** Votes enregistrés : devoirId → jeton → valeur (+1 ou -1). Un jeton n'a
-     *  qu'un vote par devoir ; un second vote remplace le précédent. */
-    val votes = mutableMapOf<Long, MutableMap<String, Int>>()
-
-    fun id() = idSuivant.getAndIncrement()
-
-    /** Lecture sous le verrou de lecture : une écriture réécrit les listes
-     *  entières, une lecture concurrente ne doit jamais en voir une à moitié
-     *  modifiée. */
-    fun <T> lecture(opération: Stockage.() -> T): T = verrou.read { opération() }
-
-    /** Suppression physique d'un devoir : le fichier JSON est réécrit sans lui,
-     *  ses votes et ses signalements sont purgés. Renvoie false si absent. */
-    fun supprimerDevoir(id: Long): Boolean = verrou.write {
-        val indice = devoirs.indexOfFirst { it.id == id }
-        if (indice < 0) false
-        else {
-            devoirs.removeAt(indice)
-            votes.remove(id)
-            purgerSignalements("devoir", id)
-            true
-        }
-    }
-
-    /** Suppression physique d'un signalement d'emploi du temps. */
-    fun supprimerProblème(id: Long): Boolean = verrou.write {
-        val indice = problèmes.indexOfFirst { it.id == id }
-        if (indice < 0) false
-        else {
-            problèmes.removeAt(indice)
-            purgerSignalements("probleme", id)
-            true
-        }
-    }
-
-    /** Suppression physique d'une correction d'emploi du temps. */
-    fun supprimerCorrection(id: Long): Boolean = verrou.write {
-        val indice = corrections.indexOfFirst { it.id == id }
-        if (indice < 0) false
-        else {
-            corrections.removeAt(indice)
-            purgerSignalements("correction", id)
-            true
-        }
-    }
-
-    /** Un signalement dont la cible disparaît n'a plus de sens. */
-    private fun purgerSignalements(cible: String, cibleId: Long) {
-        signalements.removeAll { it.cible == cible && it.cibleId == cibleId }
-    }
-
-    /** Révoque un jeton : il ne peut plus rien écrire, mais son contenu reste. */
-    fun révoquerJeton(jeton: String): Boolean = verrou.write { comptes.remove(jeton) }
-
-    /** Enregistre un signalement ; renvoie null s'il existe déjà pour ce couple
-     *  (auteur, cible). L'identifiant n'est alors pas consommé. */
-    fun signaler(auteur: String, cible: String, cibleId: Long, raison: String): Signalement? =
-        verrou.write {
-            val déjàSignale = signalements.any {
-                it.auteur == auteur && it.cible == cible && it.cibleId == cibleId
-            }
-            if (déjàSignale) null
-            else Signalement(id(), auteur, cible, cibleId, raison, now)
-                .also { signalements.add(it) }
-        }
-
-    /** Enregistre le vote d'un jeton sur un devoir et renvoie le devoir mis à
-     *  jour. Le total est ajusté de l'écart avec le vote précédent éventuel. */
-    fun voter(devoirId: Long, jeton: String, vote: Int): Devoir = verrou.write {
-        val indice = devoirs.indexOfFirst { it.id == devoirId }
-        val devoir = devoirs[indice]
-        val écart = vote - (votes[devoirId]?.get(jeton) ?: 0)
-        val modifié = devoir.copy(votes = devoir.votes + écart)
-        devoirs[indice] = modifié
-        votes.getOrPut(devoirId) { mutableMapOf() }[jeton] = vote
-        modifié
-    }
-
-    fun charger() {
-        if (!fichier.exists()) return
-        verrou.write {
-            runCatching {
-                val état = json.decodeFromString<ÉtatSauvegardé>(fichier.readText())
-                devoirs.clear(); devoirs.addAll(état.devoirs)
-                problèmes.clear(); problèmes.addAll(état.problèmes)
-                corrections.clear(); corrections.addAll(état.corrections)
-                comptes.clear(); comptes.addAll(état.comptes)
-                signalements.clear(); signalements.addAll(état.signalements)
-                votes.clear()
-                état.votes.forEach { (id, parJeton) -> votes[id] = parJeton.toMutableMap() }
-                idSuivant.set(état.idSuivant)
-            }
-        }
-    }
-
-    fun sauvegarder() {
-        verrou.read {
-            val état = ÉtatSauvegardé(
-                devoirs = devoirs.toList(),
-                problèmes = problèmes.toList(),
-                corrections = corrections.toList(),
-                comptes = comptes.toList(),
-                signalements = signalements.toList(),
-                votes = votes.mapValues { (_, parJeton) -> parJeton.toMap() },
-                idSuivant = idSuivant.get(),
-            )
-            fichier.writeText(json.encodeToString(état))
-        }
-    }
-
-    @Serializable
-    data class ÉtatSauvegardé(
-        val devoirs: List<Devoir> = emptyList(),
-        val problèmes: List<Problème> = emptyList(),
-        val corrections: List<Correction> = emptyList(),
-        val comptes: List<String> = emptyList(),
-        val signalements: List<Signalement> = emptyList(),
-        val votes: Map<Long, Map<String, Int>> = emptyMap(),
-        val idSuivant: Long = 1,
-    )
-}
-
 // — API ---------------------------------------------------------------------
 
 private val now: Long get() = System.currentTimeMillis()
 
 // — Limitation de débit ------------------------------------------------------
 
-/** Taille maximale d'un corps de requête : au-delà, réponse 413. Chaque
- *  écriture réécrit le fichier JSON en entier, on ne lit donc jamais un corps
- *  plus gros que nécessaire. */
+/** Taille maximale d'un corps de requête : au-delà, réponse 413. Le serveur
+ *  ne doit jamais retenir en mémoire un corps qu'il va rejeter. */
 const val TAILLE_CORPS_MAXIMALE = 10 * 1024
 
 /** Seuils de limitation de débit, surchargeables dans les tests. */
@@ -531,19 +390,13 @@ class ParamètreInvalide(message: String) : Exception(message)
 const val LIMITE_PAR_DÉFAUT = 50
 const val LIMITE_MAXIMALE = 500
 
-/** Tris disponibles sur les devoirs, valeur de `?tri=` sans accent. */
-val TRIS_DEVOIRS = mapOf(
-    // Les plus votés d'abord, puis les plus récents ; les ex æquo suivent
-    // l'identifiant, donc l'ordre d'insertion — jamais stable au hasard.
-    "votes" to compareByDescending<Devoir> { it.votes }
-        .thenByDescending { it.crééÀ }
-        .thenByDescending { it.id },
-    "recent" to compareByDescending<Devoir> { it.crééÀ }.thenByDescending { it.id },
-)
-
-/** Listes chronologiques : les nouveautés en tête, ex æquo par identifiant. */
-val TRI_CHRONOLOGIQUE_PROBLÈMES = compareByDescending<Problème> { it.crééÀ }.thenByDescending { it.id }
-val TRI_CHRONOLOGIQUE_CORRECTIONS = compareByDescending<Correction> { it.crééÀ }.thenByDescending { it.id }
+/** Tris disponibles sur les devoirs, valeur de `?tri=` sans accent. Le tri
+ *  lui-même est délégué à SQLite :
+ *  - « votes » : les plus votés d'abord, puis les plus récents ;
+ *  - « recent » : les plus récents d'abord.
+ *  Les ex æquo suivent l'identifiant, donc l'ordre d'insertion — jamais
+ *  stable au hasard. */
+val TRIS_DEVOIRS = setOf("votes", "recent")
 
 /** Valeurs acceptées par `?etat=`, sans accent : la comparaison se fait
  *  après normalisation, comme pour tous les paramètres d'énumération. */
@@ -671,9 +524,9 @@ fun Application.module(
         get("/mentions") { call.respond(MENTIONS) }
 
         // Les lectures ne réécrivent rien : aucune limitation de débit.
-        // Suggestions de devoirs — tri, filtres et pagination ; la réponse ne
-        // porte jamais le jeton de l'auteur, seulement son identifiant
-        // pseudonyme (voir #1 et #5).
+        // Suggestions de devoirs — tri, filtres et pagination délégués à SQLite ;
+        // la réponse ne porte jamais le jeton de l'auteur, seulement son
+        // identifiant pseudonyme (voir #1 et #5).
         get("/devoirs") {
             val tri = (call.paramètre("tri") ?: "votes").normalisé()
             if (tri !in TRIS_DEVOIRS) throw ParamètreInvalide("tri doit valoir votes ou récent")
@@ -682,20 +535,14 @@ fun Application.module(
             val limite = call.entier("limite", défaut = LIMITE_PAR_DÉFAUT, min = 1, max = LIMITE_MAXIMALE)
             val offset = call.entier("offset", défaut = 0)
 
-            val (page, total) = stockage.lecture {
-                val retenus = devoirs.filter { devoir ->
-                    (matière == null || devoir.matière.normalisé() == matière.normalisé()) &&
-                        (depuis == null || devoir.crééÀ >= depuis)
-                }
-                retenus.sortedWith(TRIS_DEVOIRS.getValue(tri))
-                    .drop(offset).take(limite).map { it.public() } to retenus.size
-            }
+            val (page, total) = stockage.devoirs(matière, depuis, tri, offset, limite)
             call.response.header(HttpHeaders.XTotalCount, total.toString())
-            call.respond(page)
+            call.respond(page.map { it.public() })
         }
 
         // Signalements d'emploi du temps — filtrables par date et par état ;
-        // « résolu » signale au moins une correction rattachée au problème.
+        // « résolu » signale au moins une correction rattachée au problème,
+        // état calculé à la lecture, jamais stocké.
         get("/edt/problemes") {
             val date = call.paramètre("date")
             val état = call.paramètre("etat", "état")?.normalisé()
@@ -706,18 +553,11 @@ fun Application.module(
             val limite = call.entier("limite", défaut = LIMITE_PAR_DÉFAUT, min = 1, max = LIMITE_MAXIMALE)
             val offset = call.entier("offset", défaut = 0)
 
-            val (page, total) = stockage.lecture {
-                val résolus = signalementsRésolus(corrections)
-                val retenus = problèmes.filter { problème ->
-                    (date == null || problème.date == date) &&
-                        (depuis == null || problème.crééÀ >= depuis) &&
-                        (état == null || problème.état(résolus).normalisé() == état)
-                }
-                retenus.sortedWith(TRI_CHRONOLOGIQUE_PROBLÈMES)
-                    .drop(offset).take(limite).map { it.public(résolus) } to retenus.size
-            }
+            val (page, total) = stockage.problèmes(
+                date, état?.let { it == ÉTAT_RÉSOLU.normalisé() }, depuis, offset, limite,
+            )
             call.response.header(HttpHeaders.XTotalCount, total.toString())
-            call.respond(page)
+            call.respond(page.map { it.public() })
         }
 
         // Corrections proposées pour l'emploi du temps — filtrables par
@@ -729,22 +569,14 @@ fun Application.module(
             val limite = call.entier("limite", défaut = LIMITE_PAR_DÉFAUT, min = 1, max = LIMITE_MAXIMALE)
             val offset = call.entier("offset", défaut = 0)
 
-            val (page, total) = stockage.lecture {
-                val retenus = corrections.filter { correction ->
-                    (problèmeId == null || correction.problèmeId == problèmeId) &&
-                        (date == null || correction.date == date) &&
-                        (depuis == null || correction.crééÀ >= depuis)
-                }
-                retenus.sortedWith(TRI_CHRONOLOGIQUE_CORRECTIONS)
-                    .drop(offset).take(limite).map { it.public() } to retenus.size
-            }
+            val (page, total) = stockage.corrections(problèmeId, date, depuis, offset, limite)
             call.response.header(HttpHeaders.XTotalCount, total.toString())
-            call.respond(page)
+            call.respond(page.map { it.public() })
         }
 
         // Signalements d'abus : un contenu est signalé à la modération, qui
         // peut ensuite le supprimer. Le jeton du signalant reste secret.
-        get("/signalements") { call.respond(stockage.signalements.map { it.public() }) }
+        get("/signalements") { call.respond(stockage.signalements().map { it.public() }) }
 
         // Inscription : rafale à la minute puis budget quotidien, par IP.
         rateLimit(RateLimitName("inscription-rafale")) {
@@ -753,8 +585,7 @@ fun Application.module(
                 // aucune donnée personnelle ne transite jamais.
                 post("/compte") {
                     val jeton = générerJeton()
-                    stockage.comptes.add(jeton)
-                    stockage.sauvegarder()
+                    stockage.créerCompte(jeton)
                     call.respond(HttpStatusCode.Created, Compte(jeton, MENTIONS.version))
                 }
             }
@@ -772,7 +603,6 @@ fun Application.module(
                     if (!stockage.révoquerJeton(jeton)) {
                         return@delete call.respond(HttpStatusCode.Unauthorized, "Jeton inconnu ou révoqué")
                     }
-                    stockage.sauvegarder()
                     call.respond(HttpStatusCode.NoContent)
                 }
 
@@ -786,8 +616,7 @@ fun Application.module(
                         id = stockage.id(), auteur = jeton, matière = entrée.matière,
                         contenu = entrée.contenu, dateRemise = entrée.dateRemise, crééÀ = now,
                     )
-                    stockage.devoirs.add(devoir)
-                    stockage.sauvegarder()
+                    stockage.ajouterDevoir(devoir)
                     call.respond(HttpStatusCode.Created, devoir.public())
                 }
                 // Suppression : réservée à l'auteur du jeton ou à la modération.
@@ -795,13 +624,12 @@ fun Application.module(
                     val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
                     val id = call.parameters["id"]?.toLongOrNull()
                         ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
-                    val devoir = stockage.devoirs.find { it.id == id }
+                    val devoir = stockage.devoir(id)
                         ?: return@delete call.respond(HttpStatusCode.NotFound, "devoir introuvable")
                     if (!peutSupprimer(devoir.auteur, jeton, jetonAdmin)) {
                         return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer ce devoir")
                     }
                     stockage.supprimerDevoir(id)
-                    stockage.sauvegarder()
                     call.respond(HttpStatusCode.NoContent)
                 }
                 // Un vote par jeton et par devoir : un second vote remplace le premier.
@@ -813,13 +641,13 @@ fun Application.module(
                     if (vote != 1 && vote != -1) {
                         return@post call.respond(HttpStatusCode.BadRequest, "vote doit valoir +1 ou -1")
                     }
-                    val devoir = stockage.devoirs.find { it.id == id }
+                    val devoir = stockage.devoir(id)
                         ?: return@post call.respond(HttpStatusCode.NotFound, "devoir introuvable")
                     if (devoir.auteur == jeton) {
                         return@post call.respond(HttpStatusCode.Forbidden, "on ne vote pas pour sa propre suggestion")
                     }
                     val modifié = stockage.voter(id, jeton, vote)
-                    stockage.sauvegarder()
+                        ?: return@post call.respond(HttpStatusCode.NotFound, "devoir introuvable")
                     call.respond(modifié.public())
                 }
 
@@ -830,21 +658,19 @@ fun Application.module(
                         return@post call.respond(HttpStatusCode.BadRequest, "description et date sont obligatoires")
                     }
                     val problème = Problème(stockage.id(), jeton, entrée.description, entrée.date, now)
-                    stockage.problèmes.add(problème)
-                    stockage.sauvegarder()
+                    stockage.ajouterProblème(problème)
                     call.respond(HttpStatusCode.Created, problème.public())
                 }
                 delete("/edt/problemes/{id}") {
                     val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
                     val id = call.parameters["id"]?.toLongOrNull()
                         ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
-                    val problème = stockage.problèmes.find { it.id == id }
+                    val problème = stockage.problème(id)
                         ?: return@delete call.respond(HttpStatusCode.NotFound, "problème introuvable")
                     if (!peutSupprimer(problème.auteur, jeton, jetonAdmin)) {
                         return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer ce signalement")
                     }
                     stockage.supprimerProblème(id)
-                    stockage.sauvegarder()
                     call.respond(HttpStatusCode.NoContent)
                 }
 
@@ -855,28 +681,26 @@ fun Application.module(
                         return@post call.respond(HttpStatusCode.BadRequest, "description et date sont obligatoires")
                     }
                     entrée.problèmeId?.let { id ->
-                        if (stockage.problèmes.none { it.id == id }) {
+                        if (stockage.problème(id) == null) {
                             return@post call.respond(HttpStatusCode.BadRequest, "problèmeId $id inconnu")
                         }
                     }
                     val correction = Correction(
                         stockage.id(), jeton, entrée.problèmeId, entrée.description, entrée.date, now,
                     )
-                    stockage.corrections.add(correction)
-                    stockage.sauvegarder()
+                    stockage.ajouterCorrection(correction)
                     call.respond(HttpStatusCode.Created, correction.public())
                 }
                 delete("/edt/corrections/{id}") {
                     val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@delete
                     val id = call.parameters["id"]?.toLongOrNull()
                         ?: return@delete call.respond(HttpStatusCode.BadRequest, "id invalide")
-                    val correction = stockage.corrections.find { it.id == id }
+                    val correction = stockage.correction(id)
                         ?: return@delete call.respond(HttpStatusCode.NotFound, "correction introuvable")
                     if (!peutSupprimer(correction.auteur, jeton, jetonAdmin)) {
                         return@delete call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut supprimer cette correction")
                     }
                     stockage.supprimerCorrection(id)
-                    stockage.sauvegarder()
                     call.respond(HttpStatusCode.NoContent)
                 }
 
@@ -891,17 +715,16 @@ fun Application.module(
                             HttpStatusCode.BadRequest, "cible doit valoir devoir, probleme ou correction")
                     }
                     val cibleExiste = when (entrée.cible) {
-                        "devoir" -> stockage.devoirs.any { it.id == entrée.cibleId }
-                        "probleme" -> stockage.problèmes.any { it.id == entrée.cibleId }
-                        else -> stockage.corrections.any { it.id == entrée.cibleId }
+                        "devoir" -> stockage.devoir(entrée.cibleId)
+                        "probleme" -> stockage.problème(entrée.cibleId)
+                        else -> stockage.correction(entrée.cibleId)
                     }
-                    if (!cibleExiste) {
+                    if (cibleExiste == null) {
                         return@post call.respond(
                             HttpStatusCode.NotFound, "${entrée.cible} ${entrée.cibleId} introuvable")
                     }
                     val signalement = stockage.signaler(jeton, entrée.cible, entrée.cibleId, entrée.raison)
                         ?: return@post call.respond(HttpStatusCode.Conflict, "contenu déjà signalé")
-                    stockage.sauvegarder()
                     call.respond(HttpStatusCode.Created, signalement.public())
                 }
             }
@@ -929,7 +752,7 @@ private suspend fun io.ktor.server.routing.RoutingCall.jetonÉcriture(
         respond(HttpStatusCode.Unauthorized, "Jeton requis")
         return null
     }
-    if (!jeton.estAdmin(jetonAdmin) && jeton !in stockage.comptes) {
+    if (!jeton.estAdmin(jetonAdmin) && !stockage.compteExiste(jeton)) {
         respond(HttpStatusCode.Unauthorized, "Jeton inconnu ou révoqué")
         return null
     }
@@ -971,7 +794,9 @@ private fun peutSupprimer(auteur: String, jeton: String, jetonAdmin: String?) =
 
 fun main() {
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
-    val stockage = Stockage(File(System.getenv("GWS_DATA") ?: "data/communaute.json"))
+    // Base SQLite : GWS_DATA nomme le fichier `.db` (ou l'ancien `.json`, que
+    // la première ouverture importe dans la base voisine, puis archive).
+    val stockage = Stockage(File(System.getenv("GWS_DATA") ?: "data/communaute.db"))
     stockage.charger()
     embeddedServer(Netty, port = port) { module(stockage) }.start(wait = true)
 }

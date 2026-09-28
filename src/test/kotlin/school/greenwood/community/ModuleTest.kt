@@ -5,7 +5,6 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.testing.*
-import java.io.File
 import kotlin.test.*
 
 private fun jetonDe(s: String): String =
@@ -59,7 +58,7 @@ class ModuleTest {
     private fun Application.avecStockageTemporaire(
         jetonAdmin: String? = null,
         origines: Collection<String> = emptyList(),
-    ) = module(Stockage(File.createTempFile("test", ".json")), jetonAdmin, origines = origines)
+    ) = module(stockageTemporaire(), jetonAdmin, origines = origines)
 
     @Test
     fun `health répond OK`() = testApplication {
@@ -227,21 +226,19 @@ class ModuleTest {
 
     @Test
     fun `les votes survivent à un rechargement`() {
-        val fichier = File.createTempFile("test", ".json")
-        fichier.delete()
-        val s1 = Stockage(fichier)
-        s1.devoirs.add(Devoir(1, "auteur-jeton", "Maths", "x", null, 0, 0))
-        s1.voter(1, "autre-jeton", 1)
-        s1.voter(1, "autre-jeton", -1)
-        s1.sauvegarder()
+        val s1 = stockageTemporaire()
+        val id = s1.id()
+        s1.ajouterDevoir(Devoir(id, "auteur-jeton", "Maths", "x", null, 0, 0))
+        s1.voter(id, "autre-jeton", 1)
+        s1.voter(id, "autre-jeton", -1)
 
-        val s2 = Stockage(fichier)
+        val s2 = rouvrir(s1)
         s2.charger()
-        val votesRechargés: Map<String, Int> = s2.votes.getValue(1L)
+        val votesRechargés: Map<String, Int> = s2.votes(id)
         assertEquals(mapOf("autre-jeton" to -1), votesRechargés)
-        assertEquals(-1, s2.devoirs.single().votes)
-        assertEquals(-1, s2.voter(1, "autre-jeton", -1).votes, "le vote remplace toujours le précédent")
-        fichier.delete()
+        assertEquals(-1, s2.devoir(id)!!.votes)
+        assertEquals(-1, s2.voter(id, "autre-jeton", -1)!!.votes,
+            "le vote remplace toujours le précédent")
     }
 
     @Test
@@ -290,18 +287,14 @@ class ModuleTest {
 
     @Test
     fun `le stockage survit à un rechargement`() {
-        val fichier = File.createTempFile("test", ".json")
-        fichier.delete() // Stockage part d'un fichier absent ou vide
-        val s1 = Stockage(fichier)
-        s1.comptes.add("eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse")
-        s1.devoirs.add(Devoir(1, "a", "Maths", "x", null, 0, 0))
-        s1.id()
-        s1.sauvegarder()
-        val s2 = Stockage(fichier)
+        val s1 = stockageTemporaire()
+        s1.créerCompte("eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse")
+        s1.ajouterDevoir(Devoir(s1.id(), "a", "Maths", "x", null, 0, 0))
+
+        val s2 = rouvrir(s1)
         s2.charger()
-        assertEquals(1, s2.devoirs.size)
-        assertTrue(s2.comptes.contains("eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse"))
-        fichier.delete()
+        assertEquals(1, s2.devoirs(matière = null, depuis = null, "votes", 0, 50).éléments.size)
+        assertTrue(s2.compteExiste("eagle-smell-bootlace-hypnoses-saddlebag-bunkhouse"))
     }
 
     // — Suppression ---------------------------------------------------------
@@ -504,27 +497,23 @@ class ModuleTest {
 
     @Test
     fun `les signalements survivent à un rechargement`() {
-        val fichier = File.createTempFile("test", ".json")
-        fichier.delete()
-        val s1 = Stockage(fichier)
-        s1.devoirs.add(Devoir(1, "auteur-jeton", "Maths", "x", null, 0, 0))
-        assertNotNull(s1.signaler("signalant", "devoir", 1, "abus"))
-        assertNull(s1.signaler("signalant", "devoir", 1, "abus"), "un seul signalement par couple")
-        s1.sauvegarder()
+        val s1 = stockageTemporaire()
+        val id = s1.id()
+        s1.ajouterDevoir(Devoir(id, "auteur-jeton", "Maths", "x", null, 0, 0))
+        assertNotNull(s1.signaler("signalant", "devoir", id, "abus"))
+        assertNull(s1.signaler("signalant", "devoir", id, "abus"), "un seul signalement par couple")
 
-        val s2 = Stockage(fichier)
+        val s2 = rouvrir(s1)
         s2.charger()
-        assertEquals(1, s2.signalements.size)
-        assertEquals("devoir", s2.signalements.single().cible)
-        assertTrue(s2.supprimerDevoir(1))
-        assertTrue(s2.signalements.isEmpty(), "le signalement suit la suppression de sa cible")
-        s2.sauvegarder()
+        assertEquals(1, s2.signalements().size)
+        assertEquals("devoir", s2.signalements().single().cible)
+        assertTrue(s2.supprimerDevoir(id))
+        assertTrue(s2.signalements().isEmpty(), "le signalement suit la suppression de sa cible")
 
-        val s3 = Stockage(fichier)
+        val s3 = rouvrir(s1)
         s3.charger()
-        assertTrue(s3.signalements.isEmpty())
-        assertTrue(s3.devoirs.isEmpty())
-        fichier.delete()
+        assertTrue(s3.signalements().isEmpty())
+        assertTrue(s3.devoirs(matière = null, depuis = null, "votes", 0, 50).éléments.isEmpty())
     }
 
     // — CORS -----------------------------------------------------------------

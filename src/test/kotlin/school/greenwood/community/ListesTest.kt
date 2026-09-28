@@ -6,14 +6,12 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.testing.*
-import java.io.File
 import kotlin.test.*;
 
 /** Tri, filtres, pagination et auteurs pseudonymes des listes publiques. */
 class ListesTest {
 
-    private fun Application.avecStockageTemporaire() =
-        module(Stockage(File.createTempFile("test", ".json")))
+    private fun Application.avecStockageTemporaire() = module(stockageTemporaire())
 
     /** Les identifiants dans l'ordre de la réponse JSON. */
     private fun idsDe(corps: String): List<Long> =
@@ -197,9 +195,9 @@ class ListesTest {
 
     @Test
     fun `la page par défaut est bornée à 50 éléments`() {
-        val stockage = Stockage(File.createTempFile("test", ".json"))
+        val stockage = stockageTemporaire()
         repeat(51) { i ->
-            stockage.devoirs.add(
+            stockage.ajouterDevoir(
                 Devoir(stockage.id(), "auteur-jeton", "Maths", "Devoir $i", null, 0, crééÀ = i.toLong()),
             )
         }

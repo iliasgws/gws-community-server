@@ -51,8 +51,8 @@ Toute écriture n'accepte que deux jetons : un jeton délivré par `POST /compte
 
 ## Suppression et modération
 
-La suppression est **physique** : le fichier JSON est réécrit sans l'élément,
-ses votes et ses signalements compris.
+La suppression est **physique** : la ligne quitte la base, ses votes et ses
+signalements compris.
 
 - `DELETE /devoirs/{id}`, `DELETE /edt/problemes/{id}`,
   `DELETE /edt/corrections/{id}` — réservés à **l'auteur du jeton**, ou au
@@ -177,15 +177,40 @@ confidentialité, à afficher avant la première écriture :
 | GET | `/signalements` | — | — (sans `auteur`) |
 | POST | `/signalements` | jeton | `{"cible","cibleId","raison"}` |
 
+## Stockage : base SQLite
+
+Les données vivent dans une **base SQLite embarquée** (`org.xerial:sqlite-jdbc`)
+à côté du serveur : aucun service externe, le fichier unique convient au
+déploiement VPS / systemd décrit plus bas.
+
+- **WAL** (`PRAGMA journal_mode=WAL`) : les lectures ne bloquent plus pendant
+  une écriture, et une écriture touche la ligne concernée au lieu de réécrire
+  tout l'état — c'était le coût appliqué à chaque `POST` auparavant.
+- **Écritures transactionnelles** : un vote (ligne *et* total), une suppression
+  (contenu, votes *et* signalements), une inscription vont ensemble ou pas du
+  tout ; un arrêt au mauvais moment ne corrompt rien.
+- **Requêtes SQL** : filtres, tri et pagination des listes publiques sont
+  exécutés par SQLite (`LIMIT`/`OFFSET`), l'historique n'a donc pas à tenir en
+  mémoire.
+- **Migration** : à la première ouverture, un ancien fichier JSON
+  (`data/communaute.json`) est importé dans la base, puis déplacé dans
+  `data/archives/`. Un fichier illisible est journalisé en erreur (`Migration
+  impossible : …`) et **laissé en place** : jamais de perte silencieuse.
+- **Tables** : `comptes`, `devoirs`, `votes` (clé composée
+  `devoir_id, jeton` — un vote par jeton et par devoir), `problemes`,
+  `corrections`, `signalements`.
+
 ## Lancer
 
 ```bash
-./gradlew run          # écoute sur :8080, stockage data/communaute.json
+./gradlew run          # écoute sur :8080, base data/communaute.db
 ./gradlew test         # suite de tests
 ```
 
 Variables d'environnement : `PORT` (défaut 8080), `GWS_DATA`
-(chemin du fichier de stockage, défaut `data/communaute.json`),
+(chemin du stockage, défaut `data/communaute.db` ; on peut y laisser
+l'ancien `data/communaute.json`, qui est alors importé à la première
+ouverture puis archivé),
 `GWS_ADMIN_TOKEN` (jeton de modération autorisé à supprimer n'importe quel
 contenu ; sans cette variable, aucun jeton n'a ce droit),
 `GWS_ORIGINS` (origines autorisées à appeler le serveur depuis un navigateur,
