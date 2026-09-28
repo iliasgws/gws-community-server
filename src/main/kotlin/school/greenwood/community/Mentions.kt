@@ -19,7 +19,7 @@ data class Mentions(val version: String, val sections: List<SectionMentions>)
 
 /** Dernière mise à jour du texte. À ne changer que si le contenu change :
  *  les clients l'utilisent pour invalider leur copie locale. */
-val VERSION_MENTIONS = "2026-09-27"
+val VERSION_MENTIONS = "2026-09-28"
 
 /** Notice complète. `contact` (variable `GWS_CONTACT`) complète la section
  *  « Éditeur » ; rien n'est inventé lorsqu'il n'est pas défini. */
@@ -42,7 +42,7 @@ fun mentions(contact: String? = System.getenv("GWS_CONTACT")): Mentions {
                     + "supprimant puis recréant un compte. Les lectures sont publiques, mais "
                     + "le jeton d'un auteur n'apparaît jamais dans les réponses publiques "
                     + "(listes de devoirs, votes, signalements). Les contenus publiés, les "
-                    + "votes et les signalements sont conservés dans un fichier JSON de "
+                    + "votes et les signalements sont conservés dans une base SQLite de "
                     + "l'hébergement, sans durée de conservation définie. Les journaux "
                     + "techniques du serveur peuvent contenir des informations de connexion.",
             ),

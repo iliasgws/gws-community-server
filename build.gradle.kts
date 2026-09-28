@@ -20,6 +20,7 @@ dependencies {
     implementation("io.ktor:ktor-server-status-pages:3.3.1")
     implementation("io.ktor:ktor-serialization-kotlinx-json:3.3.1")
     implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.7.1")
+    implementation("org.xerial:sqlite-jdbc:3.53.4.0")
     implementation("org.slf4j:slf4j-simple:2.0.17")
     testImplementation(kotlin("test"))
     testImplementation("io.ktor:ktor-server-test-host:3.3.1")
@@ -28,12 +29,16 @@ dependencies {
 
 application {
     mainClass.set("school.greenwood.community.MainKt")
+    // sqlite-jdbc charge une bibliothèque native : on autorise explicitement
+    // l'accès, sinon un futur JDK le bloquera.
+    applicationDefaultJvmArgs = listOf("--enable-native-access=ALL-UNNAMED")
 }
 
 
 
 tasks.test {
     useJUnitPlatform()
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
 }
 
 // Le JDK local est le 26 : Kotlin plafonne au 24 — on aligne Java dessus.

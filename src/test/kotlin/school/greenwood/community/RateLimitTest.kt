@@ -7,12 +7,11 @@ import io.ktor.http.content.*
 import io.ktor.server.application.*
 import io.ktor.server.testing.*
 import io.ktor.utils.io.writeString
-import java.io.File
 import kotlin.test.*
 
-/** Limitation de débit : les écritures réécrivent le fichier JSON en entier,
- *  donc budget par jeton, plafond par IP, budget quotidien pour POST /compte,
- *  et corps bornés à 10 Ko (413). */
+/** Limitation de débit : budget par jeton, plafond par IP, budget quotidien
+ *  pour POST /compte, et corps bornés à 10 Ko (413) — le serveur ne doit pas
+ *  retenir en mémoire un corps qu'il va rejeter. */
 class RateLimitTest {
 
     /** Seuils très hauts : seul le paramètre relevé par un test est abaissé. */
@@ -24,7 +23,7 @@ class RateLimitTest {
     ) = Limites(écritureParJeton, écritureParIP, inscriptionParMinute, inscriptionParJour)
 
     private fun Application.avecLimites(limites: Limites = desLimites()) =
-        module(Stockage(File.createTempFile("test", ".json")), limites = limites)
+        module(stockageTemporaire(), limites = limites)
 
     private suspend fun io.ktor.client.HttpClient.inscription(): String {
         val rep = post("/compte")
