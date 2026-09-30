@@ -27,7 +27,7 @@ CT_SWAP="${CT_SWAP:-2048}"
 DISK="${DISK:-16}"
 BRIDGE="${BRIDGE:-vmbr0}"
 STORAGE="${STORAGE:-}"
-TEMPLATE="${TEMPLATE:-debian-13-standard_13.1-2_amd64.tar.zst}"
+TEMPLATE="${TEMPLATE:-}"
 OSTEMPLATE="${GWS_OSTEMPLATE:-}"
 REPO_URL="${GWS_REPO:-https://github.com/iliasgws/gws-community-server.git}"
 REF="${GWS_REF:-main}"
@@ -128,7 +128,7 @@ free_vmid() {
 raw_self_url() {
   local r="${REPO_URL%.git}"
   case "$r" in
-    *github.com/*) printf 'https://raw.githubusercontent.com/%s/raw/%s/proxmox-install.sh' "${r#*github.com/}" "$REF" ;;
+    *github.com/*) printf 'https://raw.githubusercontent.com/%s/%s/proxmox-install.sh' "${r#*github.com/}" "$REF" ;;
     *) return 1 ;;
   esac
 }
@@ -314,6 +314,11 @@ choose_template() {
 
 ensure_template() {
   local arch dl choix wrong stor
+  if [ -z "$TEMPLATE" ]; then
+    TEMPLATE=$(choose_template)
+    [ -n "$TEMPLATE" ] || die "aucun template Debian 13 $NODE_ARCH proposé par pveam"
+    log "template Debian 13 retenu : $TEMPLATE"
+  fi
   arch=$(tpl_arch "$TEMPLATE")
 
   if [ "$arch" != "$NODE_ARCH" ]; then
@@ -472,7 +477,7 @@ INSTALL_URL=""
 REPO_NO_GIT="${REPO_URL%.git}"
 case "$REPO_NO_GIT" in
   *github.com/*)
-    INSTALL_URL="https://raw.githubusercontent.com/${REPO_NO_GIT#*github.com/}/raw/$REF/install.sh"
+    INSTALL_URL="https://raw.githubusercontent.com/${REPO_NO_GIT#*github.com/}/$REF/install.sh"
     ;;
 esac
 
@@ -480,9 +485,14 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/install.sh" ]; then
   log "installation depuis $SCRIPT_DIR/install.sh (pct push)"
   pct push "$VMID" "$SCRIPT_DIR/install.sh" /root/install.sh --perms 0755
 elif [ -n "$INSTALL_URL" ]; then
-  log "installation depuis $INSTALL_URL"
-  pct exec "$VMID" -- bash -c "curl -fsSL '$INSTALL_URL' -o /root/install.sh"
-  pct exec "$VMID" -- chmod 0755 /root/install.sh
+  INSTALL_TMP=$(mktemp)
+  trap 'rm -f "$RUNNER" "$INSTALL_TMP"' EXIT
+  log "téléchargement de $INSTALL_URL sur le nœud Proxmox"
+  command -v curl >/dev/null 2>&1 || die "curl introuvable sur le nœud Proxmox (nécessaire pour télécharger install.sh)"
+  curl -fsSL --retry 3 --max-time 60 "$INSTALL_URL?cb=$(date +%s)" -o "$INSTALL_TMP" \
+    || die "téléchargement impossible : $INSTALL_URL"
+  [ -s "$INSTALL_TMP" ] || die "install.sh téléchargé vide : $INSTALL_URL"
+  pct push "$VMID" "$INSTALL_TMP" /root/install.sh --perms 0755
 else
   die "dépôt non GitHub : placez install.sh à côté de proxmox-install.sh"
 fi

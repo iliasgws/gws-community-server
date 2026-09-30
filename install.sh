@@ -230,6 +230,11 @@ build() {
     export JAVA_HOME="$JDK_HOME"
     export PATH="$JDK_HOME/bin:$PATH"
     export GRADLE_USER_HOME="$PREFIX/.gradle"
+    # Debian LXC templates may inherit LANG=en_US.UTF-8 without that locale
+    # being generated. Kotlin class names can contain accents, so give the
+    # compiler a locale that is available on a minimal Debian installation.
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
     export GRADLE_OPTS="-Xmx${BUILD_HEAP}m -XX:MaxMetaspaceSize=384m -Dfile.encoding=UTF-8"
     export KOTLIN_DAEMON_JVM_OPTIONS="-Xmx512m"
     ./gradlew --no-daemon --console=plain \
@@ -249,7 +254,12 @@ install_dist() {
   cp -a "$SRC_DIR/build/install/$SVC_NAME/." "$release/app"
   rm -rf "$APP_HOME"
   ln -s "$release/app" "$APP_HOME"
-  if [ "$(id -u)" -eq 0 ]; then chown -R root:root "$release"; fi
+  if [ "$(id -u)" -eq 0 ]; then
+    chown -R root:root "$release"
+    # Gradle's dependency cache can create jars mode 0600 under root's umask.
+    # The unprivileged service account must be able to read the distribution.
+    chmod -R a+rX "$release"
+  fi
   chmod 755 "$PREFIX"
   ls -1dt "$RELEASES"/*/ 2>/dev/null | tail -n +3 | xargs -r rm -rf || true
   ok "installé : $APP_HOME → releases/$stamp/app"
@@ -350,7 +360,7 @@ start_and_check() {
       journalctl -u "$SVC_NAME" -n 40 --no-pager >&2 || true
       die "service $SVC_NAME redémarre en boucle (journalctl -u $SVC_NAME)"
     fi
-    code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/health" || true)
+    code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)
     if [ "$code" = "200" ]; then break; fi
     sleep 1
   done
