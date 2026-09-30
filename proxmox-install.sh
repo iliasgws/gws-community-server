@@ -10,6 +10,7 @@
 #   GWS_NODE=<nœud>  VMID=<id>  CT_HOSTNAME=gws  MEM=4096  CORES=4
 #   CT_SWAP=2048  DISK=16  STORAGE=<auto>  BRIDGE=vmbr0  TEMPLATE=<auto>
 #   GWS_PORT=8080  GWS_REF=main  GWS_ORIGINS=...  GWS_CONTACT=...
+#   GWS_OSTEMPLATE=<volid>   force la référence template (ex. local:vztmpl/…)
 # Sans tty (cron, pct exec), les défauts sont utilisés : nœud local,
 # premier VMID libre du cluster.
 # Upgrade : relancer ce script (détecte le CT déjà créé).
@@ -27,6 +28,7 @@ DISK="${DISK:-16}"
 BRIDGE="${BRIDGE:-vmbr0}"
 STORAGE="${STORAGE:-}"
 TEMPLATE="${TEMPLATE:-debian-13-standard_13.1-2_amd64.tar.zst}"
+OSTEMPLATE="${GWS_OSTEMPLATE:-}"
 REPO_URL="${GWS_REPO:-https://github.com/iliasgws/gws-community-server.git}"
 REF="${GWS_REF:-main}"
 PVE_DIR="${GWS_PVE_DIR:-/etc/pve}"
@@ -136,6 +138,7 @@ raw_self_url() {
 [ -d "$PVE_DIR" ] || die "nœud Proxmox introuvable ($PVE_DIR) : ce script crée un LXC via pct"
 command -v pct >/dev/null 2>&1 || die "commande pct introuvable"
 command -v pveam >/dev/null 2>&1 || die "commande pveam introuvable"
+command -v pvesm >/dev/null 2>&1 || die "commande pvesm introuvable"
 
 # ----------------------------------------------------------- arch du nœud
 case "$(uname -m)" in
@@ -227,7 +230,7 @@ fi
 
 # ----------------------------------------------------- relais vers un nœud
 if [ "$TARGET_NODE" != "$LOCAL_NODE" ]; then
-  FWD=(CT_HOSTNAME MEM CORES CT_SWAP DISK BRIDGE STORAGE TEMPLATE
+  FWD=(CT_HOSTNAME MEM CORES CT_SWAP DISK BRIDGE STORAGE TEMPLATE GWS_OSTEMPLATE
        GWS_PORT GWS_REF GWS_REPO GWS_ORIGINS GWS_CONTACT GWS_ADMIN_TOKEN
        GWS_BUILD_HEAP GWS_SWAP)
   envstr="env VMID=$(q "$VMID") GWS_NODE=$(q "$TARGET_NODE")"
@@ -281,6 +284,27 @@ tpl_arch() {
   esac
 }
 
+# Premier token d'une table contenant le nom de fichier (volid complet ou
+# nom nu, selon ce que pveam/pvesm affichent réellement).
+token_with() {
+  awk -v f="$TEMPLATE" '{ for (i = 1; i <= NF; i++) if (index($i, f)) { print $i; exit } }'
+}
+
+# Storage (dir/nfs actif) qui contient déjà ce template — évite un
+# re-téléchargement et donne le bon volid.
+locate_template() {
+  local stor out
+  out=$(pvesm status 2>/dev/null) || return 0
+  for stor in $(printf '%s\n' "$out" | awk '$2 == "dir" || $2 == "nfs" { print $1 }'); do
+    if pveam list "$stor" 2>/dev/null \
+        | awk -v f="$1" 'BEGIN { r = 1 } { for (i = 1; i <= NF; i++) if (index($i, f)) r = 0 } END { exit r }'; then
+      printf '%s' "$stor"
+      return 0
+    fi
+  done
+  return 0
+}
+
 # Template Debian 13 le plus récent, pour l'architecture du nœud uniquement.
 choose_template() {
   pveam available --section system 2>/dev/null \
@@ -289,8 +313,7 @@ choose_template() {
 }
 
 ensure_template() {
-  local present arch dl choix wrong
-  present=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null || true)
+  local arch dl choix wrong stor
   arch=$(tpl_arch "$TEMPLATE")
 
   if [ "$arch" != "$NODE_ARCH" ]; then
@@ -304,12 +327,15 @@ ensure_template() {
     TEMPLATE="$choix"
   fi
 
-  if printf '%s' "$present" | grep -qF "$TEMPLATE"; then
-    ok "template $TEMPLATE déjà présent"
+  stor=$(locate_template "$TEMPLATE")
+  if [ -n "$stor" ]; then
+    TEMPLATE_STORAGE="$stor"
+    TPL_LIST_OUT=$(pveam list "$stor" 2>/dev/null || true)
+    ok "template $TEMPLATE déjà présent sur $stor"
     return 0
   fi
 
-  wrong=$(printf '%s\n' "$present" \
+  wrong=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null \
     | grep -Eo "debian-13-standard_[0-9][A-Za-z0-9._-]*_(amd64|arm64)\\.tar\\.[a-z0-9]+" \
     | grep -v "_${NODE_ARCH}\\.tar" | head -n1 || true)
   if [ -n "$wrong" ]; then
@@ -318,6 +344,7 @@ ensure_template() {
 
   log "téléchargement de $TEMPLATE (≈100 Mo)"
   if dl=$(pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" 2>&1); then
+    TPL_LIST_OUT=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null || true)
     ok "template $TEMPLATE sur $TEMPLATE_STORAGE"
     return 0
   fi
@@ -332,11 +359,41 @@ ensure_template() {
   fi
   log "nouveau choix : $choix"
   TEMPLATE="$choix"
+
+  # peut-être déjà téléchargé lors d'une exécution précédente
+  stor=$(locate_template "$TEMPLATE")
+  if [ -n "$stor" ]; then
+    TEMPLATE_STORAGE="$stor"
+    TPL_LIST_OUT=$(pveam list "$stor" 2>/dev/null || true)
+    ok "template $TEMPLATE déjà présent sur $stor"
+    return 0
+  fi
+
   if ! dl=$(pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" 2>&1); then
     printf '%s\n' "$dl" | tr '\r' '\n' | sed '/^$/d' | head -n 3 >&2
     die "téléchargement de $TEMPLATE impossible"
   fi
+  TPL_LIST_OUT=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null || true)
   ok "template $TEMPLATE sur $TEMPLATE_STORAGE"
+}
+
+# Référence exploitable par pct : un simple nom de fichier ne suffit pas
+# (« can't find file ») — il faut un volid (local:vztmpl/…) ou un chemin.
+template_ref() {
+  local tok path cand
+  tok=$(printf '%s\n' "$TPL_LIST_OUT" | token_with)
+  case "$tok" in *:*) printf '%s' "$tok"; return 0 ;; esac
+  tok=$(pvesm list "$TEMPLATE_STORAGE" 2>/dev/null | token_with)
+  case "$tok" in *:*) printf '%s' "$tok"; return 0 ;; esac
+  cand="$TEMPLATE_STORAGE:vztmpl/$TEMPLATE"
+  if path=$(pvesm path "$cand" 2>/dev/null) && [ -n "$path" ] && [ -f "$path" ]; then
+    printf '%s' "$cand"
+    return 0
+  fi
+  for cand in "/var/lib/vz/template/cache/$TEMPLATE" "$TEMPLATE"; do
+    if [ -f "$cand" ]; then printf '%s' "$cand"; return 0; fi
+  done
+  return 1
 }
 ensure_template
 
@@ -350,8 +407,18 @@ if [ -n "$CONFLICT" ]; then
     die "VMID $VMID déclaré ($CONFLICT) mais inexploitable depuis ce nœud"
   fi
 else
-  log "création du CT $VMID ($CT_HOSTNAME, $TEMPLATE) : ${MEM} Mo, ${CORES} cœurs, ${DISK} Go, swap ${CT_SWAP} Mo, bridge $BRIDGE"
-  if ! create_out=$(pct create "$VMID" "$TEMPLATE" \
+  if [ -z "$OSTEMPLATE" ]; then
+    OSTEMPLATE=$(template_ref) || {
+      warn "pveam list $TEMPLATE_STORAGE :"
+      printf '%s\n' "$TPL_LIST_OUT" | sed '/^$/d' | head -n 5 >&2
+      warn "pvesm list $TEMPLATE_STORAGE :"
+      pvesm list "$TEMPLATE_STORAGE" 2>/dev/null | head -n 5 >&2 || true
+      die "template $TEMPLATE introuvable comme volume (storage $TEMPLATE_STORAGE).
+  → précisez : GWS_OSTEMPLATE=<volid>  ex. $TEMPLATE_STORAGE:vztmpl/$TEMPLATE"
+    }
+  fi
+  log "création du CT $VMID ($CT_HOSTNAME, $OSTEMPLATE) : ${MEM} Mo, ${CORES} cœurs, ${DISK} Go, swap ${CT_SWAP} Mo, bridge $BRIDGE"
+  if ! create_out=$(pct create "$VMID" "$OSTEMPLATE" \
       --hostname "$CT_HOSTNAME" \
       --memory "$MEM" \
       --swap "$CT_SWAP" \
@@ -363,9 +430,13 @@ else
       --onboot 1 \
       --start 1 2>&1); then
     printf '%s\n' "$create_out" >&2
+    other=$(free_vmid)
+    hint=""
+    if [ "$other" != "$VMID" ]; then hint="
+  → autre VMID : relancer avec VMID=$other"; fi
     die "pct create $VMID a échoué (ci-dessus).
-  → autre VMID : relancer avec VMID=$(free_vmid)
-  → lister     : qm list / pct list"
+  → template : pvesm list $TEMPLATE_STORAGE ; GWS_OSTEMPLATE=<volid>
+  → lister   : qm list / pct list$hint"
   fi
   ok "CT $VMID créé et démarré"
 fi

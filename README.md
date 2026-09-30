@@ -256,9 +256,13 @@ curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/
 - réglages non interactifs : `GWS_NODE=casaos VMID=124 MEM=8192 DISK=32
   BRIDGE=vmbr0 STORAGE=local-lvm GWS_ORIGINS=https://parent.greenwood.example
   bash proxmox-install.sh`.
-- le template est téléchargé via `pveam` s'il est absent ; si le pin
-  `13.1-2` échoue (404 miroir), le script retombe sur le plus récent
-  **de la même architecture** — jamais sur l'autre arch.
+- le template est téléchargé via `pveam` s'il est absent (recherche sur tous
+  les storages `dir`/`nfs` : déjà présent = aucun re-téléchargement) ; si le
+  pin `13.1-2` échoue (404 miroir), le script retombe sur le plus récent
+  **de la même architecture** — jamais sur l'autre arch. `pct create`
+  reçoit un **volid** résolu (`local:vztmpl/…` via `pveam list`/`pvesm`),
+  pas un simple nom de fichier, sinon PVE répond « can't find file » ;
+  en dernier recours, `GWS_OSTEMPLATE=<volid>` force la référence.
 
 **2. Dans le CT** (si vous l'avez créé vous-même) :
 
