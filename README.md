@@ -244,10 +244,13 @@ curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/
   `pct` ne crée qu'en local, un nœud différent est donc relaisé par
   `ssh root@<nœud>` avec le même script et les mêmes variables.
 - **VMID** : premier ID libre ≥ 100 dans tout le cluster (défaut entre
-  crochets), revérifié contre `/etc/pve/nodes/*/lxc/<id>.conf` — un ID pris
-  (même sur un autre nœud) arrête le script avant tout téléchargement, en
-  indiquant le nœud propriétaire et les options (autre ID, changer de nœud,
-  `pct destroy`). Un CT déjà présent sur la cible repart en mise à jour.
+  crochets), revérifié contre les configs **CT et VM QEMU**
+  (`/etc/pve/nodes/*/lxc/`, `qemu-server/`) plus un contrôle
+  `pvesh get /cluster/nextid` — un ID pris (même une VM, même sur un autre
+  nœud) arrête le script avant tout téléchargement, en indiquant le
+  propriétaire et les options (autre ID, changer de nœud, `pct destroy`) ;
+  une VM QEMU est refusée d'emblée car `pct` ne peut pas réutiliser son
+  ID. Un CT déjà présent sur la cible repart en mise à jour.
 - sans tty (cron, `pct exec`) : nœud local + premier VMID libre, sans
   question.
 - réglages non interactifs : `GWS_NODE=casaos VMID=124 MEM=8192 DISK=32

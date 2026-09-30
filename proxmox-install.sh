@@ -79,17 +79,47 @@ cluster_nodes() {
   find "$PVE_DIR/nodes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort || true
 }
 
-# VMID réellement déclarés dans le cluster (n'importe quel nœud), .conf compris.
+# Tous les IDs déclarés dans le cluster : CT (nodes/*/lxc) ET VM QEMU
+# (nodes/*/qemu-server + qemu-server/ en racine d'arbre PVE).
 used_vmids() {
-  find "$PVE_DIR/nodes" -mindepth 3 -maxdepth 3 -path '*/lxc/*' -printf '%f\n' 2>/dev/null \
-    | grep -oE '^[0-9]+' | sort -un || true
+  {
+    find "$PVE_DIR/nodes" -mindepth 3 -maxdepth 3 -path '*/lxc/*.conf' -printf '%f\n' 2>/dev/null
+    find "$PVE_DIR/nodes" -mindepth 3 -maxdepth 3 -path '*/qemu-server/*.conf' -printf '%f\n' 2>/dev/null
+    find "$PVE_DIR/qemu-server" -mindepth 1 -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null
+  } | grep -oE '^[0-9]+' | sort -un || true
+}
+
+# Config d'un ID précis (CT ou VM) ; vide si l'ID est libre.
+vmid_conf() {
+  local id="$1" f
+  for f in "$PVE_DIR/nodes"/*/lxc/"$id".conf \
+           "$PVE_DIR/nodes"/*/qemu-server/"$id".conf \
+           "$PVE_DIR/qemu-server"/"$id".conf; do
+    if [ -f "$f" ]; then printf '%s' "$f"; return 0; fi
+  done
+  return 0
+}
+
+# Filet PVE : l'API sait si un ID est pris (CT + VM), y compris pour un
+# emplacement de config qu'on n'aurait pas prévu. Ne se déclenche que si
+# PVE répond explicitement « existe déjà ».
+pve_vmid_taken() {
+  local id="$1" out
+  command -v pvesh >/dev/null 2>&1 || return 1
+  out=$(pvesh get /cluster/nextid --vmid "$id" 2>&1) && return 1
+  printf '%s' "$out" | grep -qiE 'exist|already|in use|used' || return 1
+  return 0
 }
 
 free_vmid() {
-  local used n
+  local used n api
   used=$(used_vmids)
   n=100
   while printf '%s\n' "$used" | grep -qx "$n"; do n=$((n + 1)); done
+  # si PVE signale pris ce que le scan n'a pas vu, demander l'ID libre à l'API
+  if pve_vmid_taken "$n"; then
+    api=$(pvesh get /cluster/nextid 2>/dev/null | tr -cd '0-9') && [ -n "$api" ] && n="$api"
+  fi
   printf '%s' "$n"
 }
 
@@ -146,7 +176,7 @@ tries=0
 while :; do
   if [ -z "$VMID" ]; then
     if [ "$HAVE_TTY" = 1 ]; then
-      VMID=$(ask "VMID ($USED_COUNT CT déjà déclarés dans le cluster, $PROPOSED libre)" "$PROPOSED")
+      VMID=$(ask "VMID ($USED_COUNT VM/CT déjà déclarés dans le cluster, $PROPOSED libre)" "$PROPOSED")
     else
       VMID="$PROPOSED"
       log "pas de tty : VMID auto = $VMID"
@@ -155,7 +185,7 @@ while :; do
   case "$VMID" in
     ''|*[!0-9]*) die "VMID invalide : '$VMID' (nombre attendu)" ;;
   esac
-  CONFLICT=$(find "$PVE_DIR/nodes" -maxdepth 3 -path "*/lxc/${VMID}.conf" 2>/dev/null | head -n1 || true)
+  CONFLICT=$(vmid_conf "$VMID")
   [ -z "$CONFLICT" ] && break
   if [ "$tries" -lt 2 ] && [ "$HAVE_TTY" = 1 ]; then
     warn "VMID $VMID est déjà pris ($(printf '%s' "$CONFLICT" | sed -n 's|^.*/nodes/\([^/]*\)/.*|\1|p'))"
@@ -171,12 +201,28 @@ log "VMID retenu : $VMID"
 CT_NODE=""
 if [ -n "$CONFLICT" ]; then
   CT_NODE=$(printf '%s' "$CONFLICT" | sed -n 's|^.*/nodes/\([^/]*\)/.*|\1|p')
+  if [ -z "$CT_NODE" ]; then
+    # config en /etc/pve/qemu-server : VM, l'arbre ne dit pas quel nœud la sert
+    die "VMID $VMID déjà pris : VM QEMU (config : $CONFLICT) — pct ne peut pas le réutiliser.
+  → autre VMID : relancer avec VMID=$(free_vmid)
+  → lister     : qm list / pct list"
+  fi
+  case "$CONFLICT" in
+    */qemu-server/*)
+      die "VMID $VMID déjà pris : VM QEMU du nœud '$CT_NODE' (config : $CONFLICT) — pct ne peut pas le réutiliser.
+  → autre VMID : relancer avec VMID=$(free_vmid)
+  → lister     : qm list / pct list" ;;
+  esac
   if [ "$CT_NODE" != "$TARGET_NODE" ]; then
     die "VMID $VMID déjà utilisé sur le nœud '$CT_NODE' (config : $CONFLICT), alors que la cible est '$TARGET_NODE'.
   → autre VMID     : relancer avec VMID=$(free_vmid)
   → changer de nœud: relancer avec GWS_NODE=$CT_NODE VMID=$VMID
   → supprimer      : pct destroy $VMID  (sur $CT_NODE)"
   fi
+elif pve_vmid_taken "$VMID"; then
+  die "VMID $VMID déclaré pris par PVE (/cluster/nextid) sans config trouvée sous $PVE_DIR.
+  → autre VMID : relancer avec VMID=$(free_vmid)
+  → lister     : qm list / pct list"
 fi
 
 # ----------------------------------------------------- relais vers un nœud
@@ -317,7 +363,9 @@ else
       --onboot 1 \
       --start 1 2>&1); then
     printf '%s\n' "$create_out" >&2
-    die "pct create $VMID a échoué (ci-dessus)"
+    die "pct create $VMID a échoué (ci-dessus).
+  → autre VMID : relancer avec VMID=$(free_vmid)
+  → lister     : qm list / pct list"
   fi
   ok "CT $VMID créé et démarré"
 fi
