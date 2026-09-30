@@ -232,21 +232,30 @@ Deux scripts, tous deux conçus pour un template `debian-13-standard`
 (`13.1-2_amd64` par défaut ; l'architecture du nœud est relevée via
 `uname -m` et le template téléchargé est forcément du même arch) :
 
-**1. Sur le nœud Proxmox** — crée le CT (4 Go / 4 cœurs / 16 Go, non
-privilégié, DHCP) puis lance l'installation à l'intérieur :
+**1. Sur le nœud Proxmox** — demande **le nœud** puis **le VMID**, crée le
+CT (4 Go / 4 cœurs / 16 Go, non privilégié, DHCP) et lance l'installation à
+l'intérieur :
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/proxmox-install.sh | bash
 ```
 
-Réglages : `VMID=124 MEM=8192 DISK=32 BRIDGE=vmbr0 STORAGE=local-lvm
-GWS_ORIGINS=https://parent.greenwood.example GWS_CONTACT=… bash proxmox-install.sh`.
-Le template est téléchargé via `pveam` s'il est absent ; relancer le script
-met à jour un CT déjà créé. Un VMID déjà pris — même sur un autre nœud du
-cluster — est détecté via `/etc/pve/nodes/*/lxc/<id>.conf` avant toute
-création, et le script s'arrête en indiquant le nœud concerné et les trois
-options (autre VMID, autre nœud, `pct destroy`) au lieu de planter sur
-`pct create`.
+- **nœud** : liste ceux de `/etc/pve/nodes` (défaut : le nœud courant) ;
+  `pct` ne crée qu'en local, un nœud différent est donc relaisé par
+  `ssh root@<nœud>` avec le même script et les mêmes variables.
+- **VMID** : premier ID libre ≥ 100 dans tout le cluster (défaut entre
+  crochets), revérifié contre `/etc/pve/nodes/*/lxc/<id>.conf` — un ID pris
+  (même sur un autre nœud) arrête le script avant tout téléchargement, en
+  indiquant le nœud propriétaire et les options (autre ID, changer de nœud,
+  `pct destroy`). Un CT déjà présent sur la cible repart en mise à jour.
+- sans tty (cron, `pct exec`) : nœud local + premier VMID libre, sans
+  question.
+- réglages non interactifs : `GWS_NODE=casaos VMID=124 MEM=8192 DISK=32
+  BRIDGE=vmbr0 STORAGE=local-lvm GWS_ORIGINS=https://parent.greenwood.example
+  bash proxmox-install.sh`.
+- le template est téléchargé via `pveam` s'il est absent ; si le pin
+  `13.1-2` échoue (404 miroir), le script retombe sur le plus récent
+  **de la même architecture** — jamais sur l'autre arch.
 
 **2. Dans le CT** (si vous l'avez créé vous-même) :
 

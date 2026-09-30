@@ -251,7 +251,7 @@ install_dist() {
   ln -s "$release/app" "$APP_HOME"
   if [ "$(id -u)" -eq 0 ]; then chown -R root:root "$release"; fi
   chmod 755 "$PREFIX"
-  ls -1dt "$RELEASES"/*/ 2>/dev/null | tail -n +3 | xargs -r rm -rf
+  ls -1dt "$RELEASES"/*/ 2>/dev/null | tail -n +3 | xargs -r rm -rf || true
   ok "installé : $APP_HOME → releases/$stamp/app"
 }
 
@@ -375,7 +375,7 @@ raw_install_url() {
 
 summary() {
   local ip
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
   printf '\n%s  ✔  gws-community-server installé%s\n' "$C_OK" "$C_OFF"
   printf '  URL       http://%s:%s   (GET /health, /devoirs, /mentions)\n' "${ip:-<ip-du-CT>}" "$PORT"
   printf '  Service   systemctl status %s\n' "$SVC_NAME"

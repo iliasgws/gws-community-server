@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 #
-# One-click Proxmox VE : crée le LXC depuis debian-13-standard_13.1-2_amd64
-# puis lance install.sh à l'intérieur (build + systemd + healthcheck).
+# One-click Proxmox VE : demande le nœud et le VMID, crée le LXC depuis un
+# template debian-13-standard de l'architecture du nœud, puis installe
+# gws-community-server à l'intérieur (build + systemd + healthcheck).
 #
 #   curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/proxmox-install.sh | bash
 #
-# Variables : VMID=123 CT_HOSTNAME=gws MEM=4096 CORES=4 CT_SWAP=2048 DISK=16
-#             STORAGE=<auto> BRIDGE=vmbr0 TEMPLATE=<auto> REPO=<url git>
-#             GWS_PORT=8080 GWS_REF=main GWS_ORIGINS=... GWS_CONTACT=...
-# Upgrade d'un CT existant : relancer ce script (il détecte le CT déjà créé).
+# Variables (sinon demandées à l'exécution, défauts entre crochets) :
+#   GWS_NODE=<nœud>  VMID=<id>  CT_HOSTNAME=gws  MEM=4096  CORES=4
+#   CT_SWAP=2048  DISK=16  STORAGE=<auto>  BRIDGE=vmbr0  TEMPLATE=<auto>
+#   GWS_PORT=8080  GWS_REF=main  GWS_ORIGINS=...  GWS_CONTACT=...
+# Sans tty (cron, pct exec), les défauts sont utilisés : nœud local,
+# premier VMID libre du cluster.
+# Upgrade : relancer ce script (détecte le CT déjà créé).
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VMID="${VMID:-123}"
+VMID="${VMID:-}"
+TARGET_NODE="${GWS_NODE:-}"
 CT_HOSTNAME="${CT_HOSTNAME:-gws}"
 MEM="${MEM:-4096}"
 CORES="${CORES:-4}"
@@ -27,14 +32,15 @@ REF="${GWS_REF:-main}"
 PVE_DIR="${GWS_PVE_DIR:-/etc/pve}"
 
 if [ -t 1 ]; then
-  C_LOG=$'\033[1;34m'; C_OK=$'\033[1;32m'; C_ERR=$'\033[1;31m'; C_OFF=$'\033[0m'
+  C_LOG=$'\033[1;34m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'; C_ERR=$'\033[1;31m'; C_OFF=$'\033[0m'
 else
-  C_LOG=""; C_OK=""; C_ERR=""; C_OFF=""
+  C_LOG=""; C_OK=""; C_WARN=""; C_ERR=""; C_OFF=""
 fi
 
-log() { printf '%s==>%s %s\n' "$C_LOG" "$C_OFF" "$*"; }
-ok()  { printf '%s  ok%s  %s\n' "$C_OK" "$C_OFF" "$*"; }
-die() { printf '%s err%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
+log()  { printf '%s==>%s %s\n' "$C_LOG" "$C_OFF" "$*"; }
+ok()   { printf '%s  ok%s  %s\n' "$C_OK" "$C_OFF" "$*"; }
+warn() { printf '%swarn%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+die()  { printf '%s err%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
 
 trap 'printf "%s err%s échec ligne %s\n" "$C_ERR" "$C_OFF" "${BASH_LINENO[0]:-?}" >&2; exit 1' ERR
 
@@ -44,15 +50,58 @@ proxmox-install.sh — crée le CT Debian 13 et installe gws-community-server
 
   curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/proxmox-install.sh | bash
 
-Variables : VMID CT_HOSTNAME MEM CORES CT_SWAP DISK STORAGE BRIDGE TEMPLATE
-            GWS_PORT GWS_REF GWS_ORIGINS GWS_CONTACT GWS_ADMIN_TOKEN
+Demande le nœud et le VMID (défauts : nœud local, premier ID libre du
+cluster). Variables : GWS_NODE VMID CT_HOSTNAME MEM CORES CT_SWAP DISK
+STORAGE BRIDGE TEMPLATE GWS_PORT GWS_REF GWS_ORIGINS GWS_CONTACT
 EOF
   exit 0
 }
 
 case "${1:-}" in -h|--help) usage ;; esac
 
-# ------------------------------------------------------------- préflight
+# --------------------------------------------------------------- utilitaires
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Un vrai tty ? (-r ne suffit pas : /dev/tty existe mais open() échoue sans ctty)
+if [ -r /dev/tty ] && ( : <> /dev/tty ) 2>/dev/null; then HAVE_TTY=1; else HAVE_TTY=0; fi
+
+# Question sur le terminal (jamais sur stdin : le script y arrive par pipe).
+ask() {
+  local prompt="$1" def="$2" rep=""
+  if [ "$HAVE_TTY" = 1 ]; then
+    printf '%s [%s] : ' "$prompt" "$def" > /dev/tty || true
+    IFS= read -r rep < /dev/tty || rep=""
+  fi
+  printf '%s' "${rep:-$def}"
+}
+
+cluster_nodes() {
+  find "$PVE_DIR/nodes" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort || true
+}
+
+# VMID réellement déclarés dans le cluster (n'importe quel nœud), .conf compris.
+used_vmids() {
+  find "$PVE_DIR/nodes" -mindepth 3 -maxdepth 3 -path '*/lxc/*' -printf '%f\n' 2>/dev/null \
+    | grep -oE '^[0-9]+' | sort -un || true
+}
+
+free_vmid() {
+  local used n
+  used=$(used_vmids)
+  n=100
+  while printf '%s\n' "$used" | grep -qx "$n"; do n=$((n + 1)); done
+  printf '%s' "$n"
+}
+
+raw_self_url() {
+  local r="${REPO_URL%.git}"
+  case "$r" in
+    *github.com/*) printf 'https://raw.githubusercontent.com/%s/raw/%s/proxmox-install.sh' "${r#*github.com/}" "$REF" ;;
+    *) return 1 ;;
+  esac
+}
+
+# --------------------------------------------------------------- préflight
 [ "$(id -u)" -eq 0 ] || die "exécuter en root sur le nœud Proxmox (pct/pveam)"
 [ -d "$PVE_DIR" ] || die "nœud Proxmox introuvable ($PVE_DIR) : ce script crée un LXC via pct"
 command -v pct >/dev/null 2>&1 || die "commande pct introuvable"
@@ -68,7 +117,96 @@ case "$NODE_ARCH" in
   amd64|arm64) ;;
   *) die "architecture du nœud non prise en charge : $(uname -m)" ;;
 esac
-log "nœud $(hostname) — architecture $NODE_ARCH"
+
+# ------------------------------------------------- nœud & VMID (demandés)
+LOCAL_NODE=$(hostname)
+NODES=$(cluster_nodes)
+NODE_COUNT=$(printf '%s\n' "$NODES" | grep -c . || true)
+
+if [ -z "$TARGET_NODE" ]; then
+  if [ "$NODE_COUNT" -gt 1 ] && [ "$HAVE_TTY" = 1 ]; then
+    log "nœuds du cluster : $(printf '%s' "$NODES" | tr '\n' ' ')"
+    TARGET_NODE=$(ask "nœud cible" "$LOCAL_NODE")
+  else
+    TARGET_NODE="$LOCAL_NODE"
+  fi
+fi
+if [ -n "$NODES" ] && ! printf '%s\n' "$NODES" | grep -qx "$TARGET_NODE"; then
+  if [ "$TARGET_NODE" = "$LOCAL_NODE" ]; then
+    warn "hostname '$LOCAL_NODE' absent de $PVE_DIR/nodes ($(printf '%s' "$NODES" | tr '\n' ' ')) : on reste en local"
+  else
+    die "nœud '$TARGET_NODE' inconnu — nœuds du cluster : $(printf '%s' "$NODES" | tr '\n' ' ')"
+  fi
+fi
+log "nœud cible : $TARGET_NODE (ce script tourne sur $LOCAL_NODE) — arch $NODE_ARCH"
+
+PROPOSED=$(free_vmid)
+USED_COUNT=$(used_vmids | grep -c . || true)
+tries=0
+while :; do
+  if [ -z "$VMID" ]; then
+    if [ "$HAVE_TTY" = 1 ]; then
+      VMID=$(ask "VMID ($USED_COUNT CT déjà déclarés dans le cluster, $PROPOSED libre)" "$PROPOSED")
+    else
+      VMID="$PROPOSED"
+      log "pas de tty : VMID auto = $VMID"
+    fi
+  fi
+  case "$VMID" in
+    ''|*[!0-9]*) die "VMID invalide : '$VMID' (nombre attendu)" ;;
+  esac
+  CONFLICT=$(find "$PVE_DIR/nodes" -maxdepth 3 -path "*/lxc/${VMID}.conf" 2>/dev/null | head -n1 || true)
+  [ -z "$CONFLICT" ] && break
+  if [ "$tries" -lt 2 ] && [ "$HAVE_TTY" = 1 ]; then
+    warn "VMID $VMID est déjà pris ($(printf '%s' "$CONFLICT" | sed -n 's|^.*/nodes/\([^/]*\)/.*|\1|p'))"
+    tries=$((tries + 1)); VMID=""; PROPOSED=$(free_vmid)
+    continue
+  fi
+  break   # occupé et pas de tty : le contrôle ci-dessous décide (relais ou erreur)
+done
+log "VMID retenu : $VMID"
+
+# Config déjà présente ? OK seulement si elle est sur la cible (sinon : erreur
+# de saisie — et si la cible est un autre nœud, on va y relayer pour upgrade).
+CT_NODE=""
+if [ -n "$CONFLICT" ]; then
+  CT_NODE=$(printf '%s' "$CONFLICT" | sed -n 's|^.*/nodes/\([^/]*\)/.*|\1|p')
+  if [ "$CT_NODE" != "$TARGET_NODE" ]; then
+    die "VMID $VMID déjà utilisé sur le nœud '$CT_NODE' (config : $CONFLICT), alors que la cible est '$TARGET_NODE'.
+  → autre VMID     : relancer avec VMID=$(free_vmid)
+  → changer de nœud: relancer avec GWS_NODE=$CT_NODE VMID=$VMID
+  → supprimer      : pct destroy $VMID  (sur $CT_NODE)"
+  fi
+fi
+
+# ----------------------------------------------------- relais vers un nœud
+if [ "$TARGET_NODE" != "$LOCAL_NODE" ]; then
+  FWD=(CT_HOSTNAME MEM CORES CT_SWAP DISK BRIDGE STORAGE TEMPLATE
+       GWS_PORT GWS_REF GWS_REPO GWS_ORIGINS GWS_CONTACT GWS_ADMIN_TOKEN
+       GWS_BUILD_HEAP GWS_SWAP)
+  envstr="env VMID=$(q "$VMID") GWS_NODE=$(q "$TARGET_NODE")"
+  for v in "${FWD[@]}"; do
+    val="${!v-}"
+    if [ -n "$val" ]; then envstr="$envstr $v=$(q "$val")"; fi
+  done
+  log "relais vers $TARGET_NODE (pct n'opère que localement)"
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+        "root@$TARGET_NODE" true >/dev/null 2>&1; then
+    if [ -f "$0" ] && [ -r "$0" ]; then
+      log "ssh root@$TARGET_NODE, script local"
+      exec ssh "root@$TARGET_NODE" "$envstr bash -s" < "$0"
+    fi
+    self_url=$(raw_self_url) || self_url=""
+    if [ -n "$self_url" ]; then
+      log "ssh root@$TARGET_NODE, script via $self_url"
+      exec ssh "root@$TARGET_NODE" "$envstr bash -c $(q "curl -fsSL $self_url | bash")"
+    fi
+    die "dépôt non GitHub et script non local : copiez proxmox-install.sh sur $TARGET_NODE et relancez-le là-bas"
+  fi
+  die "ssh vers root@$TARGET_NODE impossible (BatchMode) — relancez sur ce nœud :
+  ssh root@$TARGET_NODE
+  curl -fsSL $(raw_self_url 2>/dev/null || echo '<url-du-script>') | VMID=$VMID GWS_NODE=$LOCAL_NODE bash"
+fi
 
 # ------------------------------------------------------- storage & template
 pick_storage() {
@@ -101,11 +239,11 @@ tpl_arch() {
 choose_template() {
   pveam available --section system 2>/dev/null \
     | grep -Eo "debian-13-standard_[0-9][A-Za-z0-9._-]*_${NODE_ARCH}\\.tar\\.[a-z0-9]+" \
-    | sort -uV | tail -n1
+    | sort -uV | tail -n1 || true
 }
 
 ensure_template() {
-  local present arch dl choix
+  local present arch dl choix wrong
   present=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null || true)
   arch=$(tpl_arch "$TEMPLATE")
 
@@ -113,7 +251,6 @@ ensure_template() {
     log "template $TEMPLATE : arch ${arch:-inconnue} ≠ $NODE_ARCH → sélection automatique"
     choix=$(choose_template)
     if [ -z "$choix" ]; then
-      log "pveam available --section system :"
       pveam available --section system 2>&1 | head -n 15 >&2 || true
       die "aucun template Debian 13 $NODE_ARCH proposé par pveam"
     fi
@@ -126,7 +263,6 @@ ensure_template() {
     return 0
   fi
 
-  # un template de la même famille est déjà là, mais pour une autre arch → ignoré
   wrong=$(printf '%s\n' "$present" \
     | grep -Eo "debian-13-standard_[0-9][A-Za-z0-9._-]*_(amd64|arm64)\\.tar\\.[a-z0-9]+" \
     | grep -v "_${NODE_ARCH}\\.tar" | head -n1 || true)
@@ -140,7 +276,9 @@ ensure_template() {
     return 0
   fi
 
-  log "$TEMPLATE : téléchargement échoué ($(printf '%s' "$dl" | tr '\r' '\n' | tail -n1))"
+  warn "$TEMPLATE refusé par pveam :"
+  printf '%s\n' "$dl" | tr '\r' '\n' | sed '/^$/d' | head -n 3 >&2
+
   choix=$(choose_template)
   if [ -z "$choix" ]; then
     pveam available --section system 2>&1 | head -n 15 >&2 || true
@@ -148,26 +286,23 @@ ensure_template() {
   fi
   log "nouveau choix : $choix"
   TEMPLATE="$choix"
-  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null 2>&1 \
-    || die "téléchargement impossible : pveam download $TEMPLATE_STORAGE $TEMPLATE"
+  if ! dl=$(pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" 2>&1); then
+    printf '%s\n' "$dl" | tr '\r' '\n' | sed '/^$/d' | head -n 3 >&2
+    die "téléchargement de $TEMPLATE impossible"
+  fi
   ok "template $TEMPLATE sur $TEMPLATE_STORAGE"
 }
 ensure_template
 
 # ------------------------------------------------------------------ create
-VMID_CONF=$(find "$PVE_DIR/nodes" -maxdepth 3 -path "*/lxc/${VMID}.conf" 2>/dev/null | head -n1 || true)
-CT_NODE=""
-if [ -n "$VMID_CONF" ]; then CT_NODE=$(printf '%s' "$VMID_CONF" | sed -n 's|^.*/nodes/\([^/]*\)/.*|\1|p'); fi
-
-if pct status "$VMID" >/dev/null 2>&1; then
-  log "CT $VMID local déjà existant ($(pct config "$VMID" | sed -n 's/^hostname: //p')) → passage à l'installation"
-elif [ -n "$VMID_CONF" ]; then
-  log "pct status $VMID :"
-  pct status "$VMID" 2>&1 | head -n 3 >&2 || true
-  die "VMID $VMID déjà utilisé sur le nœud '${CT_NODE:-?}' (config : $VMID_CONF), non contrôlable d'ici.
-  → autre VMID   : VMID=<libre> bash $0
-  → autre nœud   : relancer la même commande sur ${CT_NODE:-?}
-  → supprimer     : pct destroy $VMID  (sur ${CT_NODE:-?})"
+if [ -n "$CONFLICT" ]; then
+  log "CT $VMID déjà déclaré sur $TARGET_NODE — vérification"
+  if pct status "$VMID" >/dev/null 2>&1; then
+    log "CT $VMID local ($(pct config "$VMID" | sed -n 's/^hostname: //p')) → passage à l'installation"
+  else
+    pct status "$VMID" 2>&1 | head -n 3 >&2 || true
+    die "VMID $VMID déclaré ($CONFLICT) mais inexploitable depuis ce nœud"
+  fi
 else
   log "création du CT $VMID ($CT_HOSTNAME, $TEMPLATE) : ${MEM} Mo, ${CORES} cœurs, ${DISK} Go, swap ${CT_SWAP} Mo, bridge $BRIDGE"
   if ! create_out=$(pct create "$VMID" "$TEMPLATE" \
@@ -203,11 +338,11 @@ trap 'rm -f "$RUNNER"' EXIT
 {
   echo "#!/usr/bin/env bash"
   echo "set -Eeuo pipefail"
-  echo "export GWS_REPO='$(printf '%s' "$REPO_URL" | sed "s/'/'\\\\''/g")'"
-  echo "export GWS_REF='$REF'"
+  echo "export GWS_REPO=$(q "$REPO_URL")"
+  echo "export GWS_REF=$(q "$REF")"
   for v in GWS_PORT GWS_ORIGINS GWS_CONTACT GWS_ADMIN_TOKEN GWS_BUILD_HEAP GWS_SWAP; do
-    eval "val=\${$v-}"
-    if [ -n "$val" ]; then echo "export $v='$(printf '%s' "$val" | sed "s/'/'\\\\''/g")'"; fi
+    val="${!v-}"
+    if [ -n "$val" ]; then echo "export $v=$(q "$val")"; fi
   done
   echo "exec bash /root/install.sh"
 } > "$RUNNER"
@@ -236,9 +371,9 @@ pct push "$VMID" "$RUNNER" /root/gws-run.sh --perms 0700
 pct exec "$VMID" -- bash /root/gws-run.sh
 pct exec "$VMID" -- rm -f /root/gws-run.sh /root/install.sh
 
-IP=$(pct exec "$VMID" -- hostname -I 2>/dev/null | awk '{print $1}')
+IP=$(pct exec "$VMID" -- hostname -I 2>/dev/null | awk '{print $1}' || true)
 PORT="${GWS_PORT:-8080}"
-printf '\n%s  ✔  CT %s prêt%s\n' "$C_OK" "$VMID" "$C_OFF"
+printf '\n%s  ✔  CT %s prêt (nœud %s)%s\n' "$C_OK" "$VMID" "$TARGET_NODE" "$C_OFF"
 printf '  IP        %s\n' "${IP:-?}"
 printf '  Entrer    pct exec %s -- bash\n' "$VMID"
 printf '  URL       http://%s:%s/health\n' "${IP:-?}" "$PORT"
