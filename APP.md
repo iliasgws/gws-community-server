@@ -69,6 +69,10 @@ Trois listes publiques, même mécanique : paramètres d'URL facultatifs,
 | `GET /edt/corrections` | `[CorrectionPublic]` |
 | `GET /signalements` | `[SignalementPublic]` (sans pagination) |
 
+Chaque `DevoirPublic` peut aussi contenir `piecesJointes`, une liste de
+métadonnées de fichiers (voir le protocole ci-dessous). L'absence de cette
+clé équivaut à une liste vide pour les anciennes réponses.
+
 Paramètres (les accents des noms sont facultatifs : `matière` = `matiere`,
 `problèmeId` = `problemeId`, `état` = `etat`) :
 
@@ -118,12 +122,16 @@ figurent toujours.
 
 ## 4. Écritures
 
-Toutes exigent `Authorization: Bearer <jeton>` et `Content-Type:
-application/json`. Corps limité à **10 Ko** (au-delà : `413`).
+Toutes les écritures JSON exigent `Authorization: Bearer <jeton>` et
+`Content-Type: application/json`. Leur corps reste limité à **10 Ko**. Les
+fichiers de devoir passent par la route multipart décrite ci-dessous, avec
+une limite dédiée de **5 Mo par fichier**.
 
 | Requête | Corps | Succès |
 |---|---|---|
 | `POST /devoirs` | `{"matière","contenu","dateRemise"?}` | `201` + `DevoirPublic` |
+| `POST /devoirs/{id}/pieces-jointes` | multipart `file` | `201` + métadonnées de la pièce jointe |
+| `GET /devoirs/{id}/pieces-jointes/{pieceId}` | — | `200` + fichier (téléchargement public) |
 | `POST /devoirs/{id}/vote` | `{"vote": 1}` ou `{"vote": -1}` | `200` + `DevoirPublic` (total mis à jour) |
 | `POST /edt/problemes` | `{"description","date"}` | `201` + `ProblèmePublic` |
 | `POST /edt/corrections` | `{"problèmeId"?,"description","date"}` | `201` + `CorrectionPublic` |
@@ -132,6 +140,35 @@ application/json`. Corps limité à **10 Ko** (au-delà : `413`).
 | `DELETE /edt/problemes/{id}` | — | `204` |
 | `DELETE /edt/corrections/{id}` | — | `204` |
 | `DELETE /compte` | — | `204` (révocation définitive) |
+
+### Fichiers joints à un devoir
+
+Après la création du devoir, son auteur envoie chaque fichier séparément :
+
+```http
+POST /devoirs/42/pieces-jointes
+Authorization: Bearer <jeton auteur>
+Content-Type: multipart/form-data; boundary=...
+
+file=<octets du fichier>
+```
+
+Le champ multipart s'appelle `file`. Un fichier peut peser jusqu'à 5 MiB
+(5 242 880 octets) ; un dépassement répond `413`. Seul l'auteur du devoir ou
+la modération peut ajouter un fichier. La réponse `201` contient par exemple :
+
+```json
+{"id":"…","nom":"fiche.pdf","type":"application/pdf","taille":12345,
+ "url":"/devoirs/42/pieces-jointes/…"}
+```
+
+`GET /devoirs` inclut `piecesJointes`, une liste de ces métadonnées avec des
+URLs relatives stables ; les lectures et téléchargements sont publics. Les
+propositions antérieures à cette fonctionnalité, ou sans fichier, restent
+valides : `piecesJointes` peut être absent dans une ancienne réponse et doit
+être traité comme une liste vide. Supprimer un devoir supprime aussi ses
+fichiers. Le nom fourni par le client sert uniquement à l'affichage ; le
+serveur attribue lui-même le nom de stockage.
 
 Règles métier que l'app doit refléter dans son UI :
 
@@ -158,7 +195,7 @@ Règles métier que l'app doit refléter dans son UI :
 | `403` | jeton valide mais interdit : suppression par un non-auteur, vote pour soi-même, ou **origine CORS non autorisée** (app web) |
 | `404` | ressource introuvable (id supprimé entre-temps) |
 | `409` | contenu déjà signalé |
-| `413` | corps > 10 Ko — tronquer la saisie avant envoi |
+| `413` | corps JSON > 10 Ko ou fichier joint > 5 MiB |
 | `429` | limite de débit atteinte, en-tête `Retry-After` = délai d'attente (secondes) |
 
 Les messages d'erreur sont en texte brut, pas en JSON — affichez le message

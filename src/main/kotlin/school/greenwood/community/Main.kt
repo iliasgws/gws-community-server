@@ -18,13 +18,16 @@ import io.ktor.server.plugins.ratelimit.rateLimit
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.receive
 import io.ktor.server.request.receiveChannel
+import io.ktor.server.request.receiveMultipart
 import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondText
+import io.ktor.server.response.respondFile
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.ktor.http.content.PartData
 import io.ktor.utils.io.readRemaining
 import kotlinx.io.readByteArray
 import kotlinx.serialization.Serializable
@@ -36,6 +39,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.text.Normalizer
 import java.util.HexFormat
+import java.util.UUID
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
 
@@ -234,9 +238,20 @@ data class DevoirPublic(
     val dateRemise: String? = null,
     val votes: Int,               // sans défaut : toujours sérialisé, même à 0
     val crééÀ: Long,
+    val piècesJointes: List<PièceJointePublic> = emptyList(),
 )
 
-fun Devoir.public() = DevoirPublic(id, auteurId(auteur), matière, contenu, dateRemise, votes, crééÀ)
+@Serializable
+data class PièceJointePublic(
+    val id: String,
+    val nom: String,
+    val type: String,
+    val taille: Long,
+    val url: String,
+)
+
+fun Devoir.public(pièces: List<PièceJointePublic> = emptyList()) =
+    DevoirPublic(id, auteurId(auteur), matière, contenu, dateRemise, votes, crééÀ, pièces)
 
 @Serializable
 data class DevoirEntrée(val matière: String, val contenu: String, val dateRemise: String? = null)
@@ -450,6 +465,7 @@ private fun io.ktor.server.routing.RoutingCall.entierOptionnel(
  *  atteinte en secondes jusqu'en 5138, en millisecondes seulement depuis
  *  mars 1973 — est prise pour des secondes. */
 private fun Long.enMillisecondes() = if (this < 100_000_000_000L) this * 1000 else this
+private const val LIMITE_PIECE_JOINTE = 5 * 1024 * 1024
 
 fun Application.module(
     stockage: Stockage,
@@ -537,7 +553,7 @@ fun Application.module(
 
             val (page, total) = stockage.devoirs(matière, depuis, tri, offset, limite)
             call.response.header(HttpHeaders.XTotalCount, total.toString())
-            call.respond(page.map { it.public() })
+            call.respond(page.map { it.public(stockage.piècesJointes(it.id)) })
         }
 
         // Signalements d'emploi du temps — filtrables par date et par état ;
@@ -617,7 +633,50 @@ fun Application.module(
                         contenu = entrée.contenu, dateRemise = entrée.dateRemise, crééÀ = now,
                     )
                     stockage.ajouterDevoir(devoir)
-                    call.respond(HttpStatusCode.Created, devoir.public())
+                    call.respond(HttpStatusCode.Created, devoir.public(stockage.piècesJointes(devoir.id)))
+                }
+                post("/devoirs/{id}/pieces-jointes") {
+                    val jeton = call.jetonÉcriture(stockage, jetonAdmin) ?: return@post
+                    val id = call.parameters["id"]?.toLongOrNull()
+                        ?: return@post call.respond(HttpStatusCode.BadRequest, "id invalide")
+                    val devoir = stockage.devoir(id)
+                        ?: return@post call.respond(HttpStatusCode.NotFound, "devoir introuvable")
+                    if (!peutSupprimer(devoir.auteur, jeton, jetonAdmin)) {
+                        return@post call.respond(HttpStatusCode.Forbidden, "seul l'auteur ou la modération peut ajouter une pièce jointe")
+                    }
+                    val multipart = call.receiveMultipart(formFieldLimit = LIMITE_PIECE_JOINTE + 65_536L)
+                    var reçu: PièceJointePublic? = null
+                    var tropGrand = false
+                    while (true) {
+                        val part = multipart.readPart() ?: break
+                        if (part is PartData.FileItem && reçu == null && !tropGrand) {
+                            val octets = part.provider().readRemaining(LIMITE_PIECE_JOINTE + 1L).readByteArray()
+                            if (octets.size > LIMITE_PIECE_JOINTE) {
+                                tropGrand = true
+                            } else {
+                                val nom = (part.originalFileName ?: "fichier").substringAfterLast('/').substringAfterLast('\\')
+                                    .filter { it.code >= 32 && it != '\u007f' }.take(180).ifBlank { "fichier" }
+                                val type = part.contentType?.toString()?.take(200) ?: "application/octet-stream"
+                                reçu = stockage.ajouterPièceJointe(id, nom, type, octets)
+                            }
+                        }
+                        part.dispose()
+                    }
+                    if (tropGrand) return@post call.respond(HttpStatusCode.PayloadTooLarge, "fichier limité à 5 Mo")
+                    if (reçu == null) return@post call.respond(HttpStatusCode.BadRequest, "champ fichier requis")
+                    call.respond(HttpStatusCode.Created, reçu!!)
+                }
+                get("/devoirs/{id}/pieces-jointes/{pieceId}") {
+                    val id = call.parameters["id"]?.toLongOrNull()
+                        ?: return@get call.respond(HttpStatusCode.BadRequest, "id invalide")
+                    val pieceId = call.parameters["pieceId"] ?: return@get call.respond(HttpStatusCode.BadRequest, "id invalide")
+                    val pièce = stockage.pièceJointe(id, pieceId)
+                        ?: return@get call.respond(HttpStatusCode.NotFound, "fichier introuvable")
+                    val fichier = stockage.fichierPièceJointe(pieceId)
+                        ?: return@get call.respond(HttpStatusCode.NotFound, "fichier introuvable")
+                    call.response.header(HttpHeaders.ContentDisposition, "attachment; filename=\"${pièce.nom.replace("\\", "_").replace("\"", "_")}\"")
+                    call.response.header(HttpHeaders.ContentType, pièce.type)
+                    call.respondFile(fichier)
                 }
                 // Suppression : réservée à l'auteur du jeton ou à la modération.
                 delete("/devoirs/{id}") {
@@ -648,7 +707,7 @@ fun Application.module(
                     }
                     val modifié = stockage.voter(id, jeton, vote)
                         ?: return@post call.respond(HttpStatusCode.NotFound, "devoir introuvable")
-                    call.respond(modifié.public())
+                    call.respond(modifié.public(stockage.piècesJointes(modifié.id)))
                 }
 
                 post("/edt/problemes") {
