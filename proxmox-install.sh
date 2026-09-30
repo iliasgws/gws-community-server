@@ -58,6 +58,18 @@ case "${1:-}" in -h|--help) usage ;; esac
 command -v pct >/dev/null 2>&1 || die "commande pct introuvable"
 command -v pveam >/dev/null 2>&1 || die "commande pveam introuvable"
 
+# ----------------------------------------------------------- arch du nœud
+case "$(uname -m)" in
+  x86_64|amd64) NODE_ARCH="amd64" ;;
+  aarch64|arm64) NODE_ARCH="arm64" ;;
+  *) NODE_ARCH="$(dpkg --print-architecture 2>/dev/null || true)" ;;
+esac
+case "$NODE_ARCH" in
+  amd64|arm64) ;;
+  *) die "architecture du nœud non prise en charge : $(uname -m)" ;;
+esac
+log "nœud $(hostname) — architecture $NODE_ARCH"
+
 # ------------------------------------------------------- storage & template
 pick_storage() {
   local types="$1" out t hit
@@ -77,38 +89,101 @@ fi
 TEMPLATE_STORAGE=$(pick_storage "dir,nfs")
 [ -n "$TEMPLATE_STORAGE" ] || TEMPLATE_STORAGE="local"
 
-if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE"; then
-  if ! pveam available --section system 2>/dev/null | grep -q "$TEMPLATE"; then
-    # la version figée n'est plus sur le miroir : on prend la plus récente
-    NEWER=$(pveam available --section system 2>/dev/null | awk '/debian-13-standard/ {print $2}' | tail -n1)
-    [ -n "$NEWER" ] || die "template Debian 13 introuvable via pveam"
-    log "template $TEMPLATE indisponible sur le miroir → $NEWER"
-    TEMPLATE="$NEWER"
+tpl_arch() {
+  case "$1" in
+    *_amd64.tar.*) echo amd64 ;;
+    *_arm64.tar.*) echo arm64 ;;
+    *) echo "" ;;
+  esac
+}
+
+# Template Debian 13 le plus récent, pour l'architecture du nœud uniquement.
+choose_template() {
+  pveam available --section system 2>/dev/null \
+    | grep -Eo "debian-13-standard_[0-9][A-Za-z0-9._-]*_${NODE_ARCH}\\.tar\\.[a-z0-9]+" \
+    | sort -uV | tail -n1
+}
+
+ensure_template() {
+  local present arch dl choix
+  present=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null || true)
+  arch=$(tpl_arch "$TEMPLATE")
+
+  if [ "$arch" != "$NODE_ARCH" ]; then
+    log "template $TEMPLATE : arch ${arch:-inconnue} ≠ $NODE_ARCH → sélection automatique"
+    choix=$(choose_template)
+    if [ -z "$choix" ]; then
+      log "pveam available --section system :"
+      pveam available --section system 2>&1 | head -n 15 >&2 || true
+      die "aucun template Debian 13 $NODE_ARCH proposé par pveam"
+    fi
+    log "template retenu : $choix (miroir, arch $NODE_ARCH)"
+    TEMPLATE="$choix"
   fi
-  log "téléchargement du template $TEMPLATE (≈100 Mo)"
-  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null
+
+  if printf '%s' "$present" | grep -qF "$TEMPLATE"; then
+    ok "template $TEMPLATE déjà présent"
+    return 0
+  fi
+
+  # un template de la même famille est déjà là, mais pour une autre arch → ignoré
+  wrong=$(printf '%s\n' "$present" \
+    | grep -Eo "debian-13-standard_[0-9][A-Za-z0-9._-]*_(amd64|arm64)\\.tar\\.[a-z0-9]+" \
+    | grep -v "_${NODE_ARCH}\\.tar" | head -n1 || true)
+  if [ -n "$wrong" ]; then
+    log "fichier local $wrong ignoré : architecture ≠ $NODE_ARCH"
+  fi
+
+  log "téléchargement de $TEMPLATE (≈100 Mo)"
+  if dl=$(pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" 2>&1); then
+    ok "template $TEMPLATE sur $TEMPLATE_STORAGE"
+    return 0
+  fi
+
+  log "$TEMPLATE : téléchargement échoué ($(printf '%s' "$dl" | tr '\r' '\n' | tail -n1))"
+  choix=$(choose_template)
+  if [ -z "$choix" ]; then
+    pveam available --section system 2>&1 | head -n 15 >&2 || true
+    die "aucun template Debian 13 $NODE_ARCH téléchargeable"
+  fi
+  log "nouveau choix : $choix"
+  TEMPLATE="$choix"
+  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null 2>&1 \
+    || die "téléchargement impossible : pveam download $TEMPLATE_STORAGE $TEMPLATE"
   ok "template $TEMPLATE sur $TEMPLATE_STORAGE"
-else
-  ok "template $TEMPLATE déjà présent"
-fi
+}
+ensure_template
 
 # ------------------------------------------------------------------ create
+VMID_CONF=$(find "$PVE_DIR/nodes" -maxdepth 3 -path "*/lxc/${VMID}.conf" 2>/dev/null | head -n1 || true)
+CT_NODE=""
+if [ -n "$VMID_CONF" ]; then CT_NODE=$(printf '%s' "$VMID_CONF" | sed -n 's|^.*/nodes/\([^/]*\)/.*|\1|p'); fi
+
 if pct status "$VMID" >/dev/null 2>&1; then
-  log "CT $VMID déjà existant ($(pct config "$VMID" | sed -n 's/^hostname: //p')) → passage à l'installation"
+  log "CT $VMID local déjà existant ($(pct config "$VMID" | sed -n 's/^hostname: //p')) → passage à l'installation"
+elif [ -n "$VMID_CONF" ]; then
+  log "pct status $VMID :"
+  pct status "$VMID" 2>&1 | head -n 3 >&2 || true
+  die "VMID $VMID déjà utilisé sur le nœud '${CT_NODE:-?}' (config : $VMID_CONF), non contrôlable d'ici.
+  → autre VMID   : VMID=<libre> bash $0
+  → autre nœud   : relancer la même commande sur ${CT_NODE:-?}
+  → supprimer     : pct destroy $VMID  (sur ${CT_NODE:-?})"
 else
-  log "création du CT $VMID ($CT_HOSTNAME) : ${MEM} Mo, ${CORES} cœurs, ${DISK} Go, swap ${CT_SWAP} Mo, bridge $BRIDGE"
-  pct create "$VMID" "$TEMPLATE" \
-    --hostname "$CT_HOSTNAME" \
-    --memory "$MEM" \
-    --swap "$CT_SWAP" \
-    --cores "$CORES" \
-    --rootfs "$STORAGE:$DISK" \
-    --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
-    --unprivileged 1 \
-    --ostype debian \
-    --onboot 1 \
-    --start 1 \
-    >/dev/null
+  log "création du CT $VMID ($CT_HOSTNAME, $TEMPLATE) : ${MEM} Mo, ${CORES} cœurs, ${DISK} Go, swap ${CT_SWAP} Mo, bridge $BRIDGE"
+  if ! create_out=$(pct create "$VMID" "$TEMPLATE" \
+      --hostname "$CT_HOSTNAME" \
+      --memory "$MEM" \
+      --swap "$CT_SWAP" \
+      --cores "$CORES" \
+      --rootfs "$STORAGE:$DISK" \
+      --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
+      --unprivileged 1 \
+      --ostype debian \
+      --onboot 1 \
+      --start 1 2>&1); then
+    printf '%s\n' "$create_out" >&2
+    die "pct create $VMID a échoué (ci-dessus)"
+  fi
   ok "CT $VMID créé et démarré"
 fi
 

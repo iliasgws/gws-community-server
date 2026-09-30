@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Installation en un clic de gws-community-server dans un LXC Proxmox
-# créé depuis le template debian-13-standard_13.1-2_amd64.
+# créé depuis un template debian-13-standard (amd64 ou arm64).
 #
 #   curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/install.sh | bash
 #
@@ -30,9 +30,18 @@ PORT="${GWS_PORT:-8080}"
 WANT_SWAP="${GWS_SWAP:-1}"
 BUILD_HEAP="${GWS_BUILD_HEAP:-}"
 
-JDK_API="https://api.adoptium.net/v3/assets/latest/24/hotspot?architecture=x64&image_type=jdk&os=linux&vendor=eclipse"
-JDK_LINK_FALLBACK="https://github.com/adoptium/temurin24-binaries/releases/download/jdk-24.0.2%2B12/OpenJDK24U-jdk_x64_linux_hotspot_24.0.2_12.tar.gz"
-JDK_SHA_FALLBACK="aea1cc55e51cf651c85f2f00ad021603fe269c4bb6493fa97a321ad770c9b096"
+# Architecture : amd64 (x64) ou arm64 (aarch64), déduite du système.
+case "$(dpkg --print-architecture 2>/dev/null || uname -m 2>/dev/null || echo unknown)" in
+  amd64|x86_64) ARCH="amd64"; JDK_ARCH="x64" ;;
+  arm64|aarch64) ARCH="arm64"; JDK_ARCH="aarch64" ;;
+  *) ARCH="inconnue"; JDK_ARCH="x64" ;;
+esac
+
+JDK_API="https://api.adoptium.net/v3/assets/latest/24/hotspot?architecture=${JDK_ARCH}&image_type=jdk&os=linux&vendor=eclipse"
+JDK_LINK_FALLBACK_AMD64="https://github.com/adoptium/temurin24-binaries/releases/download/jdk-24.0.2%2B12/OpenJDK24U-jdk_x64_linux_hotspot_24.0.2_12.tar.gz"
+JDK_SHA_FALLBACK_AMD64="aea1cc55e51cf651c85f2f00ad021603fe269c4bb6493fa97a321ad770c9b096"
+JDK_LINK_FALLBACK_ARM64="https://github.com/adoptium/temurin24-binaries/releases/download/jdk-24.0.2%2B12/OpenJDK24U-jdk_aarch64_linux_hotspot_24.0.2_12.tar.gz"
+JDK_SHA_FALLBACK_ARM64="6f8725d186d05c627176db9c46c732a6ef3ba41d9e9b3775c4727fc8ac642bb2"
 
 if [ -t 1 ]; then
   C_LOG=$'\033[1;34m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'; C_ERR=$'\033[1;31m'; C_OFF=$'\033[0m'
@@ -49,7 +58,7 @@ trap 'printf "%s err%s échec ligne %s\n" "$C_ERR" "$C_OFF" "${BASH_LINENO[0]:-?
 
 usage() {
   cat <<'EOF'
-gws-community-server — installation Proxmox LXC (Debian 13 amd64)
+gws-community-server — installation Proxmox LXC (Debian 13, amd64/arm64)
 
   curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/install.sh | bash
   bash install.sh [install|upgrade|uninstall]   (-h pour cette aide)
@@ -78,9 +87,12 @@ check_env() {
   . /etc/os-release
   [ "${ID:-}" = "debian" ] || die "distribution non prise en charge : ${ID:-?} (Debian 13 attendu)"
   if [ "${VERSION_ID:-}" != "13" ]; then
-    die "Debian 13 attendu (template debian-13-standard_13.1-2_amd64), trouvé : VERSION_ID=${VERSION_ID:-?}"
+    die "Debian 13 attendu (template debian-13-standard_13.1-2), trouvé : VERSION_ID=${VERSION_ID:-?}"
   fi
-  [ "$(dpkg --print-architecture)" = "amd64" ] || die "architecture amd64 attendue"
+  case "$ARCH" in
+    amd64|arm64) ;;
+    *) die "architecture non prise en charge : $ARCH (amd64 ou arm64 attendus)" ;;
+  esac
 }
 
 # --------------------------------------------------------------- paquets
@@ -148,9 +160,14 @@ install_jdk() {
     return 0
   fi
 
-  log "JDK Temurin 24 (classes compilées ciblent JVM 24, Debian 13 n'en fournit pas)"
-  link="$JDK_LINK_FALLBACK"
-  sha="$JDK_SHA_FALLBACK"
+  log "JDK Temurin 24 $JDK_ARCH (classes ciblent JVM 24, Debian 13 n'en fournit pas)"
+  if [ "$ARCH" = "arm64" ]; then
+    link="$JDK_LINK_FALLBACK_ARM64"
+    sha="$JDK_SHA_FALLBACK_ARM64"
+  else
+    link="$JDK_LINK_FALLBACK_AMD64"
+    sha="$JDK_SHA_FALLBACK_AMD64"
+  fi
   if json=$(curl -fsSL --retry 3 --max-time 30 "$JDK_API" 2>/dev/null); then
     local l s
     l=$(printf '%s' "$json" | sed -n 's/.*"link": *"\([^"]*\)".*/\1/p' | head -n1)
@@ -391,7 +408,7 @@ uninstall() {
 main_install() {
   need_root
   check_env
-  log "gws-community-server — Debian 13 amd64, port $PORT, ref $REF"
+  log "gws-community-server — Debian 13 $ARCH, port $PORT, ref $REF"
   apt_tune
   ensure_packages
   ensure_swap

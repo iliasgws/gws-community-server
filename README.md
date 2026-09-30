@@ -228,8 +228,9 @@ un `jvmTarget` 24).
 
 ### En un clic sous Proxmox VE (LXC Debian 13)
 
-Deux scripts, tous deux conçus pour le template
-`debian-13-standard_13.1-2_amd64` :
+Deux scripts, tous deux conçus pour un template `debian-13-standard`
+(`13.1-2_amd64` par défaut ; l'architecture du nœud est relevée via
+`uname -m` et le template téléchargé est forcément du même arch) :
 
 **1. Sur le nœud Proxmox** — crée le CT (4 Go / 4 cœurs / 16 Go, non
 privilégié, DHCP) puis lance l'installation à l'intérieur :
@@ -241,7 +242,11 @@ curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/
 Réglages : `VMID=124 MEM=8192 DISK=32 BRIDGE=vmbr0 STORAGE=local-lvm
 GWS_ORIGINS=https://parent.greenwood.example GWS_CONTACT=… bash proxmox-install.sh`.
 Le template est téléchargé via `pveam` s'il est absent ; relancer le script
-met à jour un CT déjà créé.
+met à jour un CT déjà créé. Un VMID déjà pris — même sur un autre nœud du
+cluster — est détecté via `/etc/pve/nodes/*/lxc/<id>.conf` avant toute
+création, et le script s'arrête en indiquant le nœud concerné et les trois
+options (autre VMID, autre nœud, `pct destroy`) au lieu de planter sur
+`pct create`.
 
 **2. Dans le CT** (si vous l'avez créé vous-même) :
 
@@ -251,12 +256,12 @@ curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/
 
 Ce que fait l'installateur :
 
-- vérifie Debian 13 amd64 + systemd et refuse de tourner sur l'hôte Proxmox ;
+- vérifie Debian 13 (amd64 ou arm64, déduit du nœud) + systemd et refuse de tourner sur l'hôte Proxmox ;
 - optimise apt (sans recommends, sans cache de `.deb`, retries), crée un swap
   2 Go si la RAM est faible (recommandé : `--memory 4096 --swap 2048`) ;
-- installe **Temurin JDK 24** dans `/opt/gws/jdk` (empreinte SHA-256 vérifiée
-  contre l'API Adoptium) — Debian 13 ne fournit que le JDK 21, alors que les
-  classes compilées ciblent la JVM 24 ;
+- installe **Temurin JDK 24** dans `/opt/gws/jdk` (archive `x64` ou `aarch64`
+  selon le nœud, empreinte SHA-256 vérifiée contre l'API Adoptium) — Debian 13
+  ne fournit que le JDK 21, alors que les classes compilées ciblent la JVM 24 ;
 - clone le dépôt (ou reprend le checkout courant), compile `installDist` avec
   un heap calibré sur la RAM, et publie la version dans
   `/opt/gws/releases/<date>/app` liée par `/opt/gws/community-server` (2
