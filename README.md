@@ -223,4 +223,52 @@ contact).
 
 `./gradlew installDist` produit `build/install/gws-community-server/` avec
 les scripts `bin/gws-community-server` prêts pour un VPS ou une unité
-systemd (le seul prérequis est une JVM 21+).
+systemd (le seul prérequis est une JVM 24+, les classes étant compilées avec
+un `jvmTarget` 24).
+
+### En un clic sous Proxmox VE (LXC Debian 13)
+
+Deux scripts, tous deux conçus pour le template
+`debian-13-standard_13.1-2_amd64` :
+
+**1. Sur le nœud Proxmox** — crée le CT (4 Go / 4 cœurs / 16 Go, non
+privilégié, DHCP) puis lance l'installation à l'intérieur :
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/proxmox-install.sh | bash
+```
+
+Réglages : `VMID=124 MEM=8192 DISK=32 BRIDGE=vmbr0 STORAGE=local-lvm
+GWS_ORIGINS=https://parent.greenwood.example GWS_CONTACT=… bash proxmox-install.sh`.
+Le template est téléchargé via `pveam` s'il est absent ; relancer le script
+met à jour un CT déjà créé.
+
+**2. Dans le CT** (si vous l'avez créé vous-même) :
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iliasgws/gws-community-server/main/install.sh | bash
+```
+
+Ce que fait l'installateur :
+
+- vérifie Debian 13 amd64 + systemd et refuse de tourner sur l'hôte Proxmox ;
+- optimise apt (sans recommends, sans cache de `.deb`, retries), crée un swap
+  2 Go si la RAM est faible (recommandé : `--memory 4096 --swap 2048`) ;
+- installe **Temurin JDK 24** dans `/opt/gws/jdk` (empreinte SHA-256 vérifiée
+  contre l'API Adoptium) — Debian 13 ne fournit que le JDK 21, alors que les
+  classes compilées ciblent la JVM 24 ;
+- clone le dépôt (ou reprend le checkout courant), compile `installDist` avec
+  un heap calibré sur la RAM, et publie la version dans
+  `/opt/gws/releases/<date>/app` liée par `/opt/gws/community-server` (2
+  dernières réleases conservées, rollback en recréant le lien) ;
+- crée l'utilisateur `gws`, `/etc/gws/gws.env` (mode 600) avec un jeton de
+  modération `GWS_ADMIN_TOKEN` généré à la première exécution, et les
+  données dans `/var/lib/gws/communaute.json` ;
+- installe et démarre `gws-community-server.service` (durcissement systemd :
+  `ProtectSystem=strict`, `NoNewPrivileges`, capacités vidées), puis attend
+  `GET /health` → 200 avant de résumer.
+
+Journal : `journalctl -u gws-community-server -f`. Mise à jour : relancer le
+même script. Désinstallation : `bash install.sh uninstall`
+(`GWS_PURGE_DATA=1` pour effacer aussi les données).
+
