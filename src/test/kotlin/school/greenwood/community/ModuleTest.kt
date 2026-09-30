@@ -3,6 +3,8 @@ package school.greenwood.community
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.client.request.forms.*
+import io.ktor.http.content.*
 import io.ktor.server.application.*
 import io.ktor.server.testing.*
 import kotlin.test.*
@@ -59,6 +61,55 @@ class ModuleTest {
         jetonAdmin: String? = null,
         origines: Collection<String> = emptyList(),
     ) = module(stockageTemporaire(), jetonAdmin, origines = origines)
+
+    @Test
+    fun `les pièces jointes sont téléchargeables et supprimées avec le devoir`() = testApplication {
+        val stockage = stockageTemporaire()
+        application { module(stockage) }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jeton)
+        val contenu = "document de test".encodeToByteArray()
+        val upload = client.post("/devoirs/$id/pieces-jointes") {
+            header("Authorization", "Bearer $jeton")
+            setBody(MultiPartFormDataContent(formData {
+                append("file", contenu, Headers.build {
+                    append(HttpHeaders.ContentDisposition, "filename=\"devoir.txt\"")
+                    append(HttpHeaders.ContentType, "text/plain")
+                })
+            }))
+        }
+        assertEquals(HttpStatusCode.Created, upload.status)
+        val meta = upload.bodyAsText()
+        assertTrue(meta.contains("devoir.txt"))
+        assertTrue(client.get("/devoirs").bodyAsText().contains("pieces-jointes"))
+        val url = Regex(""""url":"([^"]+)"""").find(meta)!!.groupValues[1]
+        val storedFile = stockage.fichierPièceJointe(Regex(""""id":"([^"]+)"""").find(meta)!!.groupValues[1])!!
+        val téléchargement = client.get(url)
+        assertEquals(HttpStatusCode.OK, téléchargement.status)
+        assertContentEquals(contenu, téléchargement.readRawBytes())
+        assertEquals(HttpStatusCode.NoContent, client.supprimer("/devoirs/$id", jeton).status)
+        assertFalse(storedFile.exists(), "le fichier est supprimé du stockage")
+        assertEquals(HttpStatusCode.NotFound, client.get(url).status)
+    }
+
+    @Test
+    fun `une pièce jointe de plus de 5 Mo est refusée`() = testApplication {
+        val stockage = stockageTemporaire()
+        application { module(stockage) }
+        val jeton = jetonDe(client.post("/compte").bodyAsText())
+        val id = client.nouveauDevoir(jeton)
+        val upload = client.post("/devoirs/$id/pieces-jointes") {
+            header("Authorization", "Bearer $jeton")
+            setBody(MultiPartFormDataContent(formData {
+                append("file", ByteArray(5 * 1024 * 1024 + 1), Headers.build {
+                    append(HttpHeaders.ContentDisposition, "filename=\"large.bin\"")
+                    append(HttpHeaders.ContentType, "application/octet-stream")
+                })
+            }))
+        }
+        assertEquals(HttpStatusCode.PayloadTooLarge, upload.status)
+        assertFalse(client.get("/devoirs").bodyAsText().contains("large.bin"))
+    }
 
     @Test
     fun `health répond OK`() = testApplication {

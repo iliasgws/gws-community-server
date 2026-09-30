@@ -11,6 +11,7 @@ import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -78,6 +79,14 @@ CREATE TABLE IF NOT EXISTS votes (
     valeur INTEGER NOT NULL,
     PRIMARY KEY (devoir_id, jeton)
 );
+CREATE TABLE IF NOT EXISTS pieces_jointes (
+    id TEXT PRIMARY KEY,
+    devoir_id INTEGER NOT NULL,
+    nom TEXT NOT NULL,
+    type TEXT NOT NULL,
+    taille INTEGER NOT NULL,
+    stockage TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS problemes (
     id INTEGER PRIMARY KEY,
     auteur TEXT NOT NULL,
@@ -121,6 +130,46 @@ class Stockage(fichier: File) {
 
     /** Base SQLite effectivement utilisée, à côté de l'historique JSON. */
     val base: File get() = chemins.base
+    val répertoirePiècesJointes: File get() = File(chemins.base.parentFile, "pieces-jointes")
+
+    fun piècesJointes(devoirId: Long): List<PièceJointePublic> = connection {
+        prepareStatement("SELECT id, nom, type, taille FROM pieces_jointes WHERE devoir_id = ? ORDER BY rowid").use {
+            it.setLong(1, devoirId)
+            it.executeQuery().use { r -> buildList {
+                while (r.next()) {
+                    val id = r.getString("id")
+                    add(PièceJointePublic(id, r.getString("nom"), r.getString("type"), r.getLong("taille"), "/devoirs/$devoirId/pieces-jointes/$id"))
+                }
+            } }
+        }
+    }
+
+    fun pièceJointe(devoirId: Long, id: String): PièceJointePublic? = piècesJointes(devoirId).firstOrNull { it.id == id }
+
+    fun ajouterPièceJointe(devoirId: Long, nom: String, type: String, octets: ByteArray): PièceJointePublic? {
+        val id = UUID.randomUUID().toString()
+        val fichier = File(répertoirePiècesJointes, id)
+        répertoirePiècesJointes.mkdirs()
+        java.nio.file.Files.write(fichier.toPath(), octets)
+        try {
+            écriture {
+                if (unDevoir(devoirId) == null) return@écriture false
+                prepareStatement("INSERT INTO pieces_jointes(id, devoir_id, nom, type, taille, stockage) VALUES(?, ?, ?, ?, ?, ?)").use {
+                    it.setString(1, id); it.setLong(2, devoirId); it.setString(3, nom); it.setString(4, type)
+                    it.setLong(5, octets.size.toLong()); it.setString(6, id); it.executeUpdate()
+                }
+                true
+            }.also { if (!it) fichier.delete() }
+        } catch (e: Throwable) { fichier.delete(); throw e }
+        return pièceJointe(devoirId, id)
+    }
+
+    fun fichierPièceJointe(id: String): File? = connection {
+        prepareStatement("SELECT stockage FROM pieces_jointes WHERE id = ?").use {
+            it.setString(1, id)
+            it.executeQuery().use { r -> if (r.next()) File(répertoirePiècesJointes, r.getString(1)).takeIf(File::isFile) else null }
+        }
+    }
 
     init {
         schéma()
@@ -326,19 +375,31 @@ class Stockage(fichier: File) {
 
     /** Suppression physique d'un devoir : contenu, votes et signalements dans
      *  une seule transaction. Renvoie false si absent. */
-    fun supprimerDevoir(id: Long): Boolean = écriture {
-        val supprimé = prepareStatement("DELETE FROM devoirs WHERE id = ?").use {
-            it.setLong(1, id)
-            it.executeUpdate() > 0
-        }
-        if (supprimé) {
-            prepareStatement("DELETE FROM votes WHERE devoir_id = ?").use {
+    fun supprimerDevoir(id: Long): Boolean {
+        val (supprimé, fichiers) = écriture {
+            val pièces = prepareStatement("SELECT stockage FROM pieces_jointes WHERE devoir_id = ?").use {
                 it.setLong(1, id)
-                it.executeUpdate()
+                it.executeQuery().use { r -> buildList { while (r.next()) add(r.getString(1)) } }
             }
-            purgerSignalements("devoir", id)
+            val supprimé = prepareStatement("DELETE FROM devoirs WHERE id = ?").use {
+                it.setLong(1, id)
+                it.executeUpdate() > 0
+            }
+            if (supprimé) {
+                prepareStatement("DELETE FROM pieces_jointes WHERE devoir_id = ?").use {
+                    it.setLong(1, id)
+                    it.executeUpdate()
+                }
+                prepareStatement("DELETE FROM votes WHERE devoir_id = ?").use {
+                    it.setLong(1, id)
+                    it.executeUpdate()
+                }
+                purgerSignalements("devoir", id)
+            }
+            supprimé to if (supprimé) pièces else emptyList()
         }
-        supprimé
+        fichiers.forEach { File(répertoirePiècesJointes, it).delete() }
+        return supprimé
     }
 
     // — Signalements d'emploi du temps -------------------------------------
